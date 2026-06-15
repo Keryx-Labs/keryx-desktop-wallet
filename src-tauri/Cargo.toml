@@ -1,0 +1,26 @@
+[package]
+name = "keryx-wallet"
+version = "0.1.0"
+description = "Keryx Wallet"
+authors = ["Keryx"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "keryx_wallet_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+# Portable build: store the WebView2 user data (the wallet's encrypted localStorage/IndexedDB)
+# next to the .exe instead of %AppData%, so the app + its wallet travel together (USB). The normal
+# (installed) build does NOT enable this — it uses the OS data dir.
+portable = []

@@ -1,0 +1,30 @@
+node_modules
+dist
+src-tauri/target
+src-tauri/gen
+*.log
+shots/
+
+# Build outputs / installers (do not commit binaries)
+dist-installers/
+*.exe
+*.msi
+*.deb
+*.AppImage
+*.dmg
+*.app
+*.tar.gz
+
+# Local backups & debug/handoff notes (may contain addresses, IPs, local paths)
+backups/
+WALLET_DEBUG_HANDOFF.md
+*.handoff.md
+
+# Local tooling / editor config (not part of the project)
+.claude/
+
+# Secrets / local env
+.env
+.env.*
+*.pem
+*.key
