@@ -15,6 +15,7 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
 
   const [stats, setStats] = useState<Stats | null>(null);
   const [startCount, setStartCount] = useState<number | null>(null);
+  const [progressMsg, setProgressMsg] = useState<string | null>(null);
   const [diag, setDiag] = useState<string | null>(null);
   const pollRef = useRef<number | null>(null);
 
@@ -52,14 +53,12 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
       return;
     }
     setBusy(true);
+    setProgressMsg(null);
     try {
-      const before = stats?.count ?? null;
+      const before = (await loadStats())?.count ?? stats?.count ?? null;
       setStartCount(before);
-      const ids = await wallet.consolidate(password);
-      setPassword("");
-      setTxids(ids);
-      // Watch the UTXO count drop live as the batches confirm, then stop once
-      // there is nothing left to consolidate (a single UTXO or none).
+      // Watch the UTXO count drop live for the WHOLE multi-batch run. consolidate() now auto-loops
+      // batch-by-batch on the wallet side, so this can take a while; keep polling until ≤1 remains.
       if (pollRef.current !== null) window.clearInterval(pollRef.current);
       pollRef.current = window.setInterval(() => {
         void loadStats().then((s) => {
@@ -69,8 +68,22 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
           }
         });
       }, 5000) as unknown as number;
+
+      const ids = await wallet.consolidate(password, (info) => {
+        // Each confirmed batch: refresh the count immediately (snappier than the 5s poll) and show
+        // where we are, like the web wallet's live batch progress.
+        setProgressMsg(
+          `Batch ${info.batch} confirmed · ${info.remaining} UTXO${info.remaining === 1 ? "" : "s"} left`
+        );
+        void loadStats();
+      });
+      setPassword("");
+      setTxids(ids);
+      setProgressMsg(null);
+      void loadStats();
     } catch (e) {
       setPassword("");
+      setProgressMsg(null);
       setErr(
         e instanceof Error
           ? e.message
@@ -125,9 +138,11 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
                 />
               </div>
               <p className="mt-1 text-right text-[10px] text-emerald-200/40">
-                {count <= 1
-                  ? "fully consolidated"
-                  : `${count} UTXOs remaining${startCount ? ` (started at ${startCount})` : ""}`}
+                {progressMsg
+                  ? progressMsg
+                  : count <= 1
+                    ? "fully consolidated"
+                    : `${count} UTXOs remaining${startCount ? ` (started at ${startCount})` : ""}`}
               </p>
             </div>
           )}
@@ -136,9 +151,10 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
         {!txids ? (
           <>
             <p className="mb-4 text-sm text-emerald-100/70">
-              Combines your many small UTXOs into fewer, larger ones by sending them back to
+              Combines your many small UTXOs into a single larger one by sending them back to
               yourself. Handy if you receive lots of small payments (e.g. mining). It pays the
-              network fee and may take several batch transactions — your balance stays yours.
+              network fee and runs as many batch transactions as needed automatically, waiting for
+              each to confirm — keep this window open until it finishes. Your balance stays yours.
             </p>
             <label className="label">Confirm with your password</label>
             <input
@@ -170,9 +186,10 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
           <div className="text-center">
             <p className="mb-2 text-lg font-bold text-keryx-green">Submitted ✓</p>
             <p className="mb-3 text-sm text-emerald-100/70">
-              {txids.length} batch transaction{txids.length === 1 ? "" : "s"} sent. The bar above
-              updates live as they confirm and the UTXO count drops. The consolidated balance
-              becomes spendable after it matures.
+              {txids.length} batch transaction{txids.length === 1 ? "" : "s"} confirmed. {count <= 1
+                ? "Everything is now consolidated into a single UTXO."
+                : `${count} UTXOs remain — if that's still more than you want, run Consolidate again.`}{" "}
+              The consolidated balance becomes spendable after it matures.
             </p>
             <div className="mb-5 max-h-32 space-y-1 overflow-y-auto">
               {txids.map((id) => (
@@ -190,21 +207,25 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
           </div>
         )}
 
-        {/* Debug aid: if consolidation seems stuck, this shows what the node vs the wallet engine
-            see (read-only). Helps pin down a stuck send. */}
-        <div className="mt-4 border-t border-keryx-border pt-3 text-right">
-          <button
-            className="text-[10px] text-emerald-200/30 hover:text-keryx-green"
-            onClick={() => void runDiag()}
-          >
-            Run diagnostics
-          </button>
-          {diag && (
-            <pre className="mt-2 max-h-52 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-keryx-border bg-black/40 p-2 text-left text-[10px] leading-snug text-emerald-100/70">
-              {diag}
-            </pre>
-          )}
-        </div>
+        {/* Debug aid (dev-only): shows what the node vs the wallet engine see (read-only) to pin
+            down a stuck send. Exposes the full address list + raw UTXO dump (no secrets, but
+            deanonymizing if pasted publicly), so it's gated behind import.meta.env.DEV and stripped
+            from production builds. */}
+        {import.meta.env.DEV && (
+          <div className="mt-4 border-t border-keryx-border pt-3 text-right">
+            <button
+              className="text-[10px] text-emerald-200/30 hover:text-keryx-green"
+              onClick={() => void runDiag()}
+            >
+              Run diagnostics
+            </button>
+            {diag && (
+              <pre className="mt-2 max-h-52 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-keryx-border bg-black/40 p-2 text-left text-[10px] leading-snug text-emerald-100/70">
+                {diag}
+              </pre>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

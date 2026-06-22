@@ -65,6 +65,22 @@ export interface SendEstimate {
   summary?: kaspa.GeneratorSummary;
 }
 
+/** Per-batch progress reported by the consolidate auto-loop after each confirmed batch. */
+export interface ConsolidateProgress {
+  /** 1-based index of the batch that just confirmed. */
+  batch: number;
+  /** Submitted transaction id of that batch. */
+  txid: string;
+  /** UTXOs left on the wallet after this batch confirmed. */
+  remaining: number;
+}
+
+/** Stable identity for a UTXO (transactionId:index), used to tell when a batch's inputs are gone. */
+function outpointKey(e: { outpoint?: { transactionId?: string; index?: number } }): string {
+  const op = e.outpoint ?? {};
+  return `${op.transactionId ?? ""}:${op.index ?? 0}`;
+}
+
 type Listener = () => void;
 
 // Map of TransactionDataType-ish strings to a coarse direction.
@@ -902,15 +918,17 @@ class WalletService {
   }
 
   /**
-   * Consolidate (compound) UTXOs: spends your many small UTXOs back to your own change address in
-   * as few transactions as possible — the SDK batches automatically when they don't fit one tx.
-   * Implemented via accountsSend WITHOUT a destination (the SDK then targets the change address).
-   * No priority fee on a sweep (the wallet-core rejects sender/receiver-pays fees there). Returns
-   * the batch transaction ids.
+   * Consolidate (compound) UTXOs: spends your many small UTXOs back to your own change address,
+   * compounding the WHOLE set into a single UTXO. One tx caps at MAX_TX_INPUTS inputs, so the manual
+   * path AUTO-LOOPS batch-by-batch (waiting for each to confirm) until ≤1 UTXO remains — see
+   * consolidateManual. `onProgress` fires after each confirmed batch. Returns the batch txids.
    */
-  async consolidate(password: string): Promise<string[]> {
+  async consolidate(
+    password: string,
+    onProgress?: (info: ConsolidateProgress) => void
+  ): Promise<string[]> {
     // Same reason as send(): bypass the empty UtxoContext and sweep via the manual path.
-    return this.consolidateManual(password);
+    return this.consolidateManual(password, onProgress);
   }
 
   // =====================================================================
@@ -939,6 +957,10 @@ class WalletService {
   /** Max inputs per transaction. A P2PK input is ~1100 mass and the standard cap is ~100k, so ~84
    *  inputs fit; stay safely under. Consolidating >this many UTXOs takes several runs. */
   private static readonly MAX_TX_INPUTS = 80;
+  /** Backstop for the consolidate auto-loop. Each batch nets at least −1 UTXO, so a real run needs
+   *  ≈ceil((N−1)/(MAX_TX_INPUTS−1)) batches (e.g. ~8 for 600 UTXOs); this cap only trips if the set
+   *  inexplicably fails to shrink. */
+  private static readonly MAX_CONSOLIDATE_BATCHES = 200;
   /** Keryx's minimum relay fee (sompi). The node rejects txs paying less than this regardless of
    *  size (≈0.3 KRX, anti-spam) — far above Kaspa's mass-based minimum. */
   private static readonly KERYX_MIN_FEE = 30000000n;
@@ -1228,11 +1250,21 @@ class WalletService {
   }
 
   /**
-   * CONTEXT-FREE consolidate (compound). Sweeps up to MAX_TX_INPUTS UTXOs into ONE output back to
-   * our own change/receive address, via the synchronous build path (no async Generator → no hang).
-   * If there are more UTXOs than fit one tx, this does one batch; re-run to keep compounding.
+   * CONTEXT-FREE consolidate (compound). Sweeps the whole UTXO set into a single UTXO back to our
+   * own change/receive address, via the synchronous build path (no async Generator → no hang).
+   *
+   * One transaction can only carry MAX_TX_INPUTS inputs, so for a large set this AUTO-LOOPS: it
+   * submits a batch of the largest ≤MAX_TX_INPUTS UTXOs, WAITS for the node to accept it and consume
+   * those inputs, then re-reads a fresh UTXO set and submits the next batch — repeating until ≤1
+   * UTXO remains. The wait between batches is essential: without it fetchEntries would return the
+   * just-spent UTXOs (still in mempool, not yet removed from the utxoindex) and the next tx would
+   * double-spend and be rejected. `onProgress` fires after each confirmed batch so the UI can show
+   * the count dropping live. Returns every batch's txid.
    */
-  async consolidateManual(password: string): Promise<string[]> {
+  async consolidateManual(
+    password: string,
+    onProgress?: (info: ConsolidateProgress) => void
+  ): Promise<string[]> {
     if (!this.wallet || !this._accountId) throw new Error("Wallet is locked.");
     if (this.conn !== "connected" || !this.synced) {
       throw new Error("Connect to a synced node first.");
@@ -1241,29 +1273,75 @@ class WalletService {
     const keyMap = this.deriveKeyMap(password);
     this.assertDerivationMatches(keyMap);
     const keys = Array.from(keyMap.values());
-    const entries = await this.fetchEntries();
-    if (entries.length < 2) {
-      throw new Error("Nothing to consolidate (need at least 2 UTXOs).");
-    }
 
     const changeAddress = this.receiveAddress ?? this.accountAddresses[0];
     if (!changeAddress) throw new Error("No change/receive address available.");
 
-    // No explicit outputs → everything (minus fee) goes to the single change output = a compound.
-    const txid = await this.buildSignSubmitSync(entries, changeAddress, [], keys, 0n);
-    // A consolidate is a self-send: the funds stay yours, so record it as a neutral (no +/-) entry
-    // showing the amount swept in this batch (the inputs actually used, capped at MAX_TX_INPUTS).
-    const swept = entries
-      .slice(0, WalletService.MAX_TX_INPUTS)
-      .reduce((s, e) => s + BigInt(e.amount), 0n);
-    this.recordLocalActivity({
-      id: txid,
-      type: "consolidate",
-      direction: "other",
-      amountSompi: swept,
-      timestamp: Date.now(),
-    });
-    return [txid];
+    const txids: string[] = [];
+    // Each batch removes at least one UTXO (used≥2 → net −(used−1)≥−1), so the loop always
+    // terminates; MAX_CONSOLIDATE_BATCHES is a backstop against an unexpected non-shrinking set.
+    for (let batch = 0; batch < WalletService.MAX_CONSOLIDATE_BATCHES; batch++) {
+      const entries = await this.fetchEntries();
+      if (entries.length < 2) {
+        // Nothing (left) to consolidate. First-iteration → honest error; later → we're simply done.
+        if (batch === 0) throw new Error("Nothing to consolidate (need at least 2 UTXOs).");
+        break;
+      }
+
+      const used = entries.slice(0, WalletService.MAX_TX_INPUTS);
+      const spent = new Set(used.map(outpointKey));
+
+      // No explicit outputs → everything (minus fee) goes to the single change output = a compound.
+      const txid = await this.buildSignSubmitSync(entries, changeAddress, [], keys, 0n);
+      txids.push(txid);
+      // A consolidate is a self-send: the funds stay yours, so record it as a neutral (no +/-) entry
+      // showing the amount swept in this batch (the inputs actually used, capped at MAX_TX_INPUTS).
+      const swept = used.reduce((s, e) => s + BigInt(e.amount), 0n);
+      this.recordLocalActivity({
+        id: txid,
+        type: "consolidate",
+        direction: "other",
+        amountSompi: swept,
+        timestamp: Date.now(),
+      });
+
+      // Wait for the node to consume this batch's inputs before reading the set for the next one.
+      // If it does not confirm in time, the batches we DID submit are real and recorded — stop here
+      // and return them; the caller's live poll keeps tracking and the user can run it again.
+      let remaining: number;
+      try {
+        remaining = await this.waitForInputsConsumed(spent);
+      } catch {
+        onProgress?.({ batch: batch + 1, txid, remaining: entries.length - used.length + 1 });
+        break;
+      }
+      onProgress?.({ batch: batch + 1, txid, remaining });
+      if (remaining < 2) break;
+    }
+
+    return txids;
+  }
+
+  /**
+   * Poll the node until NONE of the given input outpoints remain in our UTXO set — i.e. the batch we
+   * just submitted has been accepted into the DAG and its inputs consumed (the new compound output
+   * is then present too). Returns the remaining UTXO count. Time-boxed so a tx that never confirms
+   * surfaces as an error instead of spinning forever.
+   */
+  private async waitForInputsConsumed(
+    spent: Set<string>,
+    timeoutMs = 120000,
+    pollMs = 2500
+  ): Promise<number> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const entries = await this.fetchEntries();
+      if (!entries.some((e) => spent.has(outpointKey(e)))) return entries.length;
+      if (Date.now() > deadline) {
+        throw new Error("Consolidation batch did not confirm in time.");
+      }
+      await new Promise((r) => setTimeout(r, pollMs));
+    }
   }
 
   /**

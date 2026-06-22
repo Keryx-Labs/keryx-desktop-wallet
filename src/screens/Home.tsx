@@ -107,9 +107,12 @@ export function Home() {
         </div>
       )}
 
-      {/* Diagnostics: only surfaced when there's likely a problem (connected but no balance and not
-          still scanning). Hidden during normal use — it's a safety net, not everyday UI. */}
-      {w.conn === "connected" &&
+      {/* Diagnostics: dev-only. It exposes the full address list + per-address balances + raw UTXO
+          dump (no secrets, but pasting it publicly deanonymizes the wallet), so it's gated behind
+          import.meta.env.DEV and stripped from production builds. Even in dev it's only surfaced
+          when there's likely a problem (connected but no balance and not still scanning). */}
+      {import.meta.env.DEV &&
+        w.conn === "connected" &&
         !w.scanning &&
         w.balance.mature === 0n &&
         w.balance.pending === 0n && (
