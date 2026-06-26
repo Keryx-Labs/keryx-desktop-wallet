@@ -115,6 +115,7 @@ class WalletService {
   private fallbackTimer: number | null = null;
   private gotBalanceEvent = false; // a real "balance" event takes precedence over the fallback sum
   private accountAddresses: string[] = []; // receive+change(+more) for the direct-UTXO fallback
+  private txInFlight = false; // serializes the manual send/consolidate money path (one tx at a time)
   // --- instrumentation (debugging the empty-context / send-hang issue) ---
   private eventCount = 0;
   private lastEventTypes: string[] = [];
@@ -869,15 +870,28 @@ class WalletService {
     // webview's wasm executor (same as createTransactions), so we size the tx with the SYNCHRONOUS
     // createTransaction + calculateTransactionFee. kaspa.d.ts: createTransaction 174,
     // calculateTransactionFee 73. No keys needed for a fee estimate.
-    const entries = (await this.fetchEntries()).slice(0, WalletService.MAX_TX_INPUTS);
-    if (entries.length === 0) throw new Error("No spendable UTXOs found.");
+    const all = await this.fetchEntries();
+    if (all.length === 0) throw new Error("No spendable UTXOs found.");
+    const entries = all.slice(0, WalletService.MAX_TX_INPUTS);
     const changeAddress = this.receiveAddress ?? this.accountAddresses[0];
     if (!changeAddress) throw new Error("No change address available.");
     const total: bigint = entries.reduce(
       (s: bigint, e: any) => s + BigInt(e.amount),
       0n
     );
-    const sent: bigint = amountSompi <= total ? amountSompi : total;
+    // Stay consistent with send(): don't quote a fee for an amount send() will then refuse. If the
+    // largest MAX_TX_INPUTS UTXOs can't fund the amount but more UTXOs exist, the answer is to
+    // consolidate first — surface that here instead of clamping sent=total and returning a fee.
+    if (amountSompi > total) {
+      if (all.length > entries.length) {
+        throw new Error(
+          `This amount needs more than ${WalletService.MAX_TX_INPUTS} UTXOs in one transaction. ` +
+            `Consolidate your funds first, then send.`
+        );
+      }
+      throw new Error("Amount exceeds your spendable balance.");
+    }
+    const sent: bigint = amountSompi;
     const change: bigint = total - sent;
     const outs: { address: string; amount: bigint }[] = [
       { address: destAddress, amount: sent },
@@ -952,8 +966,12 @@ class WalletService {
   //   the .d.ts alone — they must be checked against a known funded address.
   // =====================================================================
 
-  /** How many receive/change indices to derive when building the key map. */
+  /** Minimum receive/change indices to derive when building the key map. */
   private static readonly MANUAL_SCAN_DEPTH = 20;
+  /** Hard cap on how deep deriveKeyMap will go while covering known addresses (backstop against an
+   *  unexpectedly huge / malformed accountAddresses set). 1000 indices = 2000 keys, derived only
+   *  when the wallet has actually rotated that far. */
+  private static readonly MAX_SCAN_DEPTH = 1000;
   /** Max inputs per transaction. A P2PK input is ~1100 mass and the standard cap is ~100k, so ~84
    *  inputs fit; stay safely under. Consolidating >this many UTXOs takes several runs. */
   private static readonly MAX_TX_INPUTS = 80;
@@ -998,11 +1016,26 @@ class WalletService {
     const gen = new kaspa.PrivateKeyGenerator(xprv.toString(), false, 0n);
 
     const map = new Map<string, kaspa.PrivateKey>();
-    for (let i = 0; i < depth; i++) {
+    // We must be able to sign a UTXO on ANY address the node may report for us, and fetchEntries
+    // queries exactly this.accountAddresses (receive/change + every rotated "new" receive address).
+    // A FIXED depth therefore leaves high-index addresses (heavy new-address rotation) unsignable —
+    // their UTXOs get fetched, sorted largest-first into the tx, then fail at sign/submit. So derive
+    // at least `depth`, then keep going until every known account address is covered, capped at
+    // MAX_SCAN_DEPTH.
+    const stillNeeded = new Set(this.accountAddresses);
+    for (
+      let i = 0;
+      (i < depth || stillNeeded.size > 0) && i < WalletService.MAX_SCAN_DEPTH;
+      i++
+    ) {
       const rk = gen.receiveKey(i);
-      map.set(rk.toAddress(this._networkId).toString(), rk);
+      const ra = rk.toAddress(this._networkId).toString();
+      map.set(ra, rk);
+      stillNeeded.delete(ra);
       const ck = gen.changeKey(i);
-      map.set(ck.toAddress(this._networkId).toString(), ck);
+      const ca = ck.toAddress(this._networkId).toString();
+      map.set(ca, ck);
+      stillNeeded.delete(ca);
     }
     return map;
   }
@@ -1013,13 +1046,35 @@ class WalletService {
    * and we MUST NOT sign — abort loudly instead of broadcasting an invalid/garbage transaction.
    */
   private assertDerivationMatches(keyMap: Map<string, kaspa.PrivateKey>): void {
-    // Every funded address the node reports must be coverable by a derived key. At minimum the
-    // primary receive address must be in the derived set.
+    // Derivation-correctness probe: if our PRIMARY receive address isn't reproduced by the
+    // derivation, the path params (coin type / account index / multisig) are wrong and every key is
+    // wrong — abort before signing. (Per-UTXO coverage of the specific addresses we're about to
+    // spend is enforced separately by assertEntriesCovered.)
     const probe = this.receiveAddress ?? this.accountAddresses[0];
     if (probe && !keyMap.has(probe)) {
       throw new Error(
         "Key derivation does not match this wallet's addresses — aborting to avoid signing with " +
           "the wrong keys. (Manual transaction path disabled for safety.)"
+      );
+    }
+  }
+
+  /**
+   * SAFETY GATE: every UTXO we're about to spend must have a derived signing key in `keyMap`, or
+   * signTransaction would leave an unsigned input and the node would reject the whole tx at submit.
+   * With deriveKeyMap now covering all known addresses this should never trip, but if a UTXO ever
+   * lands on an address beyond MAX_SCAN_DEPTH we abort BEFORE signing with an honest message instead
+   * of building a doomed transaction.
+   */
+  private assertEntriesCovered(
+    entries: any[],
+    keyMap: Map<string, kaspa.PrivateKey>
+  ): void {
+    const uncovered = entries.filter((e) => !keyMap.has(e.address));
+    if (uncovered.length > 0) {
+      throw new Error(
+        `${uncovered.length} of your UTXOs are on addresses this wallet cannot derive a signing ` +
+          `key for — aborting to avoid building an unspendable transaction.`
       );
     }
   }
@@ -1127,31 +1182,45 @@ class WalletService {
     if (!this.validateAddress(destAddress)) {
       throw new Error("Invalid destination address.");
     }
+    // Serialize money ops: a send and a consolidate (or two sends) running at once would build over
+    // the same UTXO set and the second tx would be rejected at submit. No fund loss, but avoid it.
+    if (this.txInFlight) {
+      throw new Error("Another transaction is already in progress. Please wait.");
+    }
+    this.txInFlight = true;
+    try {
+      const keyMap = this.deriveKeyMap(password);
+      this.assertDerivationMatches(keyMap);
+      const keys = Array.from(keyMap.values());
+      const entries = await this.fetchEntries();
+      if (entries.length === 0) throw new Error("No spendable UTXOs found.");
+      // Every UTXO that will go into the tx must be signable (the largest MAX_TX_INPUTS are used).
+      this.assertEntriesCovered(
+        entries.slice(0, WalletService.MAX_TX_INPUTS),
+        keyMap
+      );
 
-    const keyMap = this.deriveKeyMap(password);
-    this.assertDerivationMatches(keyMap);
-    const keys = Array.from(keyMap.values());
-    const entries = await this.fetchEntries();
-    if (entries.length === 0) throw new Error("No spendable UTXOs found.");
+      const changeAddress = this.receiveAddress ?? this.accountAddresses[0];
+      if (!changeAddress) throw new Error("No change address available.");
 
-    const changeAddress = this.receiveAddress ?? this.accountAddresses[0];
-    if (!changeAddress) throw new Error("No change address available.");
-
-    const txid = await this.buildSignSubmitSync(
-      entries,
-      changeAddress,
-      [{ address: destAddress, amount: amountSompi }],
-      keys,
-      priorityFeeSompi
-    );
-    this.recordLocalActivity({
-      id: txid,
-      type: "outgoing",
-      direction: "out",
-      amountSompi,
-      timestamp: Date.now(),
-    });
-    return [txid];
+      const txid = await this.buildSignSubmitSync(
+        entries,
+        changeAddress,
+        [{ address: destAddress, amount: amountSompi }],
+        keys,
+        priorityFeeSompi
+      );
+      this.recordLocalActivity({
+        id: txid,
+        type: "outgoing",
+        direction: "out",
+        amountSompi,
+        timestamp: Date.now(),
+      });
+      return [txid];
+    } finally {
+      this.txInFlight = false;
+    }
   }
 
   /**
@@ -1208,7 +1277,15 @@ class WalletService {
       (massFee > WalletService.KERYX_MIN_FEE ? massFee : WalletService.KERYX_MIN_FEE) +
       extraFee;
     const change = total - sent - fee;
-    if (change < 0n) throw new Error("Amount + network fee exceeds your balance.");
+    if (change < 0n) {
+      // A consolidate has no user "amount" (targetOutputs is empty) — the only spend is the network
+      // fee, so a deficit means the balance is below the fee, not that an amount is too large.
+      throw new Error(
+        targetOutputs.length === 0
+          ? "Your total balance is below the minimum network fee — nothing to consolidate."
+          : "Amount + network fee exceeds your balance."
+      );
+    }
     // 2) rebuild with the fee deducted from the change output, then sign + submit.
     tx = this.stageSync("build", () => build(change));
     // Pass keys as HEX STRINGS, not PrivateKey instances: the packaged build's wasm-bindgen
@@ -1269,27 +1346,35 @@ class WalletService {
     if (this.conn !== "connected" || !this.synced) {
       throw new Error("Connect to a synced node first.");
     }
+    // Serialize money ops (see sendManual): don't let a concurrent send/consolidate build over the
+    // same UTXO set. The whole multi-batch run holds the lock.
+    if (this.txInFlight) {
+      throw new Error("Another transaction is already in progress. Please wait.");
+    }
+    this.txInFlight = true;
+    try {
+      const keyMap = this.deriveKeyMap(password);
+      this.assertDerivationMatches(keyMap);
+      const keys = Array.from(keyMap.values());
 
-    const keyMap = this.deriveKeyMap(password);
-    this.assertDerivationMatches(keyMap);
-    const keys = Array.from(keyMap.values());
+      const changeAddress = this.receiveAddress ?? this.accountAddresses[0];
+      if (!changeAddress) throw new Error("No change/receive address available.");
 
-    const changeAddress = this.receiveAddress ?? this.accountAddresses[0];
-    if (!changeAddress) throw new Error("No change/receive address available.");
+      const txids: string[] = [];
+      // Each batch removes at least one UTXO (used≥2 → net −(used−1)≥−1), so the loop always
+      // terminates; MAX_CONSOLIDATE_BATCHES is a backstop against an unexpected non-shrinking set.
+      for (let batch = 0; batch < WalletService.MAX_CONSOLIDATE_BATCHES; batch++) {
+        const entries = await this.fetchEntries();
+        if (entries.length < 2) {
+          // Nothing (left) to consolidate. First iteration → honest error; later → we're simply done.
+          if (batch === 0) throw new Error("Nothing to consolidate (need at least 2 UTXOs).");
+          break;
+        }
 
-    const txids: string[] = [];
-    // Each batch removes at least one UTXO (used≥2 → net −(used−1)≥−1), so the loop always
-    // terminates; MAX_CONSOLIDATE_BATCHES is a backstop against an unexpected non-shrinking set.
-    for (let batch = 0; batch < WalletService.MAX_CONSOLIDATE_BATCHES; batch++) {
-      const entries = await this.fetchEntries();
-      if (entries.length < 2) {
-        // Nothing (left) to consolidate. First-iteration → honest error; later → we're simply done.
-        if (batch === 0) throw new Error("Nothing to consolidate (need at least 2 UTXOs).");
-        break;
-      }
-
-      const used = entries.slice(0, WalletService.MAX_TX_INPUTS);
-      const spent = new Set(used.map(outpointKey));
+        const used = entries.slice(0, WalletService.MAX_TX_INPUTS);
+        // Every UTXO in this batch must be signable, or the batch fails at submit.
+        this.assertEntriesCovered(used, keyMap);
+        const spent = new Set(used.map(outpointKey));
 
       // No explicit outputs → everything (minus fee) goes to the single change output = a compound.
       const txid = await this.buildSignSubmitSync(entries, changeAddress, [], keys, 0n);
@@ -1317,9 +1402,12 @@ class WalletService {
       }
       onProgress?.({ batch: batch + 1, txid, remaining });
       if (remaining < 2) break;
-    }
+      }
 
-    return txids;
+      return txids;
+    } finally {
+      this.txInFlight = false;
+    }
   }
 
   /**
