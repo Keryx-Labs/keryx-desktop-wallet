@@ -51,6 +51,43 @@ export function Receive({ onClose }: { onClose: () => void }) {
 
         {w.receiveAddress ? (
           <>
+            {w.receiveAddresses.length > 1 && (
+              <div className="mb-4 w-full">
+                <p className="label">Active address</p>
+                <div className="flex flex-col gap-2">
+                  {w.receiveAddresses.map((a, i) => {
+                    const active = a === w.receiveAddress;
+                    return (
+                      <button
+                        key={a}
+                        type="button"
+                        onClick={() => {
+                          try {
+                            wallet.selectReceiveAddress(a);
+                          } catch {
+                            /* ignore */
+                          }
+                        }}
+                        className={`flex items-center justify-between gap-2 rounded-lg border px-3 py-2 text-left text-xs transition-colors ${
+                          active
+                            ? "border-keryx-green/60 bg-keryx-green/10 text-keryx-green"
+                            : "border-keryx-border bg-black/20 text-emerald-100/80 hover:border-keryx-green/40"
+                        }`}
+                      >
+                        <span>
+                          Address {i + 1}
+                          {active && <span className="ml-1.5 text-[10px]">✓</span>}
+                        </span>
+                        <span className="font-mono text-[11px] text-emerald-200/50">
+                          {a.slice(0, 10)}…{a.slice(-6)}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
             <canvas
               ref={canvasRef}
               className="rounded-xl border border-keryx-border"
@@ -65,11 +102,25 @@ export function Receive({ onClose }: { onClose: () => void }) {
               <button
                 className="btn-primary flex-1"
                 onClick={newAddress}
-                disabled={busy}
+                disabled={busy || !w.canAddReceiveAddress}
+                title={
+                  w.canAddReceiveAddress
+                    ? "Create another receive address (max 3)"
+                    : "Maximum of 3 addresses reached"
+                }
               >
-                {busy ? "Deriving…" : "New address"}
+                {busy
+                  ? "Deriving…"
+                  : w.canAddReceiveAddress
+                    ? "New address"
+                    : "Max reached"}
               </button>
             </div>
+            {!w.canAddReceiveAddress && (
+              <p className="mt-2 w-full text-center text-xs text-emerald-200/40">
+                This wallet keeps up to 3 addresses — switch between them above.
+              </p>
+            )}
           </>
         ) : (
           <p className="py-12 text-sm text-emerald-200/40">No address yet.</p>
