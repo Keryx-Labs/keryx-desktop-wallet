@@ -63,13 +63,19 @@ export default function App() {
   }, [phase, lock, autoLockMinutes]);
 
   async function saveSettings(s: { url: string; networkId: string }, nextAutoLockMinutes: number) {
+    const prev = loadNodeSettings();
+    const nodeChanged = s.url !== prev.url || s.networkId !== prev.networkId;
     saveNodeSettings(s);
     saveAutoLockMinutes(nextAutoLockMinutes);
     setAutoLockMinutes(nextAutoLockMinutes);
-    const wasOpen = phase === "home";
-    await wallet.setNode(s); // locks + resets if a wallet is open (network mismatch guard)
     setShowSettings(false);
-    if (wasOpen) setPhase("unlock"); // changed node/network → re-unlock on the new network
+    // Only reconnect (which locks the wallet) when the node actually changed — saving just the
+    // auto-lock timeout must not log the user out.
+    if (nodeChanged) {
+      const wasOpen = phase === "home";
+      await wallet.setNode(s); // locks + resets if a wallet is open (network mismatch guard)
+      if (wasOpen) setPhase("unlock"); // changed node/network → re-unlock on the new network
+    }
   }
 
   if (phase === "loading") {
