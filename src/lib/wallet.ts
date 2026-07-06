@@ -1086,6 +1086,11 @@ class WalletService {
   /** Max inputs per transaction. A P2PK input is ~1100 mass and the standard cap is ~100k, so ~84
    *  inputs fit; stay safely under. Consolidating >this many UTXOs takes several runs. */
   private static readonly MAX_TX_INPUTS = 80;
+  // Coinbase (mining-reward) UTXOs can't be spent until this many DAA have passed; the node
+  // rejects a tx that spends an immature one ("coinbase maturity ... hasn't passed yet"). The
+  // value is Keryx's coinbase maturity, taken from the node's own rejection message; ideally
+  // read from INetworkParams later.
+  private static readonly COINBASE_MATURITY = 1000n;
   /** Backstop for the consolidate auto-loop. Each batch nets at least −1 UTXO, so a real run needs
    *  ≈ceil((N−1)/(MAX_TX_INPUTS−1)) batches (e.g. ~8 for 600 UTXOs); this cap only trips if the set
    *  inexplicably fails to shrink. */
@@ -1263,11 +1268,32 @@ class WalletService {
         isCoinbase: !!r.isCoinbase,
       };
     });
+    // Skip immature coinbase (mining-reward) UTXOs: the node rejects a tx that spends one before
+    // COINBASE_MATURITY DAA have passed, so only a miner with freshly-mined rewards hits this. Use
+    // the live virtual DAA; refresh it once if we don't have it yet. If it stays unknown we don't
+    // filter (the node would reject anyway — never worse). Excluding a borderline reward just
+    // defers it to a later batch; it can't move wrong/double funds.
+    let daa = this.nodeDaa;
+    if (daa == null) {
+      try {
+        const info = await this.wallet.rpc.getServerInfo();
+        daa = info.virtualDaaScore;
+        this.nodeDaa = daa;
+      } catch {
+        /* leave daa null → skip the maturity filter this round */
+      }
+    }
+    const spendable =
+      daa != null
+        ? mapped.filter(
+            (e) => !e.isCoinbase || daa - e.blockDaaScore >= WalletService.COINBASE_MATURITY
+          )
+        : mapped;
     // Spend the LARGEST UTXOs first. A send/estimate is capped at MAX_TX_INPUTS inputs per tx, so
     // taking the node's arbitrary order could slice off dust and fail to fund a send that is well
     // within the real balance. Largest-first guarantees one tx funds the maximum possible amount.
-    mapped.sort((a, b) => (a.amount < b.amount ? 1 : a.amount > b.amount ? -1 : 0));
-    return mapped;
+    spendable.sort((a, b) => (a.amount < b.amount ? 1 : a.amount > b.amount ? -1 : 0));
+    return spendable;
   }
 
   /**
