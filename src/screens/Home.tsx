@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
-import { wallet, formatKrx, HistoryEntry } from "../lib/wallet";
+import { wallet, formatKrxShort, HistoryEntry, ReceivedEntry } from "../lib/wallet";
 import { useWalletState } from "../lib/useWallet";
 import { Send } from "./Send";
 import { Receive } from "./Receive";
 import { Consolidate } from "./Consolidate";
 import { Chat } from "./Chat";
+import { Addresses } from "./Addresses";
 
 const HISTORY_POLL_MS = 15_000;
 
@@ -14,6 +15,8 @@ export function Home() {
   const [showReceive, setShowReceive] = useState(false);
   const [showConsolidate, setShowConsolidate] = useState(false);
   const [showChat, setShowChat] = useState(false);
+  const [showAddresses, setShowAddresses] = useState(false);
+  const [sentShown, setSentShown] = useState(10);
   const [diag, setDiag] = useState<string | null>(null);
   const [diagBusy, setDiagBusy] = useState(false);
 
@@ -30,6 +33,8 @@ export function Home() {
   }
 
   const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [received, setReceived] = useState<ReceivedEntry[]>([]);
+  const [recvShown, setRecvShown] = useState(10);
   const [historyErr, setHistoryErr] = useState<string | null>(null);
   const [loadingHistory, setLoadingHistory] = useState(false);
 
@@ -41,6 +46,7 @@ export function Home() {
       void wallet.refreshBalanceFromUtxos();
       const h = await wallet.history(50);
       setHistory(h);
+      setReceived(await wallet.receivedEntries());
       setHistoryErr(null);
     } catch (e) {
       setHistoryErr(
@@ -138,12 +144,12 @@ export function Home() {
       <div className="panel">
         <p className="label">Balance</p>
         <p className="text-5xl font-bold leading-tight text-keryx-green">
-          {formatKrx(w.balance.mature)}{" "}
+          {formatKrxShort(w.balance.mature)}{" "}
           <span className="text-xl font-medium text-emerald-200/50">KRX</span>
         </p>
         {w.balance.pending > 0n && (
           <p className="mt-2 text-sm text-amber-300">
-            +{formatKrx(w.balance.pending)} KRX pending
+            +{formatKrxShort(w.balance.pending)} KRX pending
           </p>
         )}
 
@@ -176,21 +182,57 @@ export function Home() {
             Not connected — sending is disabled.
           </p>
         )}
-        {canTransact && w.balance.mature > 0n && (
+        <div className="mt-3 flex gap-2">
+          {canTransact && w.balance.mature > 0n && (
+            <button
+              className="btn-ghost flex-1 text-xs"
+              onClick={() => setShowConsolidate(true)}
+              title="Combine many small UTXOs into fewer (handy for mining payouts)"
+            >
+              Consolidate UTXOs
+            </button>
+          )}
           <button
-            className="mt-3 text-xs text-emerald-200/50 hover:text-keryx-green"
-            onClick={() => setShowConsolidate(true)}
-            title="Combine many small UTXOs into fewer (handy for mining payouts)"
+            className="btn-ghost flex-1 text-xs"
+            onClick={() => setShowAddresses(true)}
+            title="See your addresses and switch the active account"
           >
-            Consolidate UTXOs
+            My addresses
           </button>
+        </div>
+      </div>
+
+      {/* Received — incoming deposits for the ACTIVE account (per-account, persistent forward log). */}
+      <div className="panel mt-5">
+        <p className="label mb-3">Received</p>
+        {received.length === 0 ? (
+          <p className="px-2 py-6 text-center text-xs leading-relaxed text-emerald-200/40">
+            Incoming deposits for this account are recorded here from now on and stay even
+            after you spend them.
+          </p>
+        ) : (
+          <>
+            <ul className="divide-y divide-keryx-border">
+              {received.slice(0, recvShown).map((u) => (
+                <ReceivedRow key={`${u.txid}:${u.index}`} u={u} />
+              ))}
+            </ul>
+            {received.length > recvShown && (
+              <button
+                className="mt-3 w-full text-center text-xs text-emerald-200/50 hover:text-keryx-green"
+                onClick={() => setRecvShown((n) => n + 10)}
+              >
+                Show more ({received.length - recvShown})
+              </button>
+            )}
+          </>
         )}
       </div>
 
-      {/* Activity */}
+      {/* Sent — this account's own outgoing txs (send/consolidate) */}
       <div className="panel mt-5">
         <div className="mb-3 flex items-center justify-between">
-          <p className="label mb-0">Activity</p>
+          <p className="label mb-0">Sent</p>
           <button
             className="btn-ghost px-3 py-1 text-xs"
             onClick={() => void refreshHistory()}
@@ -209,11 +251,21 @@ export function Home() {
             No transactions yet.
           </p>
         ) : (
-          <ul className="divide-y divide-keryx-border">
-            {history.map((tx, i) => (
-              <ActivityRow key={tx.id || `tx-${i}`} tx={tx} />
-            ))}
-          </ul>
+          <>
+            <ul className="divide-y divide-keryx-border">
+              {history.slice(0, sentShown).map((tx, i) => (
+                <ActivityRow key={tx.id || `tx-${i}`} tx={tx} />
+              ))}
+            </ul>
+            {history.length > sentShown && (
+              <button
+                className="mt-3 w-full text-center text-xs text-emerald-200/50 hover:text-keryx-green"
+                onClick={() => setSentShown((n) => n + 10)}
+              >
+                Show more ({history.length - sentShown})
+              </button>
+            )}
+          </>
         )}
       </div>
 
@@ -223,6 +275,7 @@ export function Home() {
         <Consolidate onClose={() => setShowConsolidate(false)} />
       )}
       {showChat && <Chat onClose={() => setShowChat(false)} />}
+      {showAddresses && <Addresses onClose={() => setShowAddresses(false)} />}
     </div>
   );
 }
@@ -266,7 +319,59 @@ function ActivityRow({ tx }: { tx: HistoryEntry }) {
       </div>
       <span className={`shrink-0 font-mono text-sm font-semibold ${color}`}>
         {sign}
-        {formatKrx(tx.amountSompi)} KRX
+        {formatKrxShort(tx.amountSompi)} KRX
+      </span>
+    </li>
+  );
+}
+
+function ReceivedRow({ u }: { u: ReceivedEntry }) {
+  const [copied, setCopied] = useState(false);
+  const shortId = u.txid ? `${u.txid.slice(0, 8)}…${u.txid.slice(-6)}` : "—";
+  const explorer = u.txid ? `https://keryx-labs.com/tx/${u.txid}` : undefined;
+  function copyId() {
+    if (!u.txid) return;
+    navigator.clipboard?.writeText(u.txid).catch(() => {});
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  }
+  return (
+    <li className="flex items-center justify-between py-3">
+      <div className="min-w-0">
+        <p className="text-sm text-emerald-100/90">
+          {u.isCoinbase ? "Mining reward" : "Received"}
+        </p>
+        <div className="flex items-center gap-2">
+          {explorer ? (
+            <a
+              href={explorer}
+              target="_blank"
+              rel="noreferrer"
+              className="font-mono text-xs text-emerald-200/50 hover:text-keryx-green"
+            >
+              {shortId} ↗
+            </a>
+          ) : (
+            <span className="font-mono text-xs text-emerald-200/40">{shortId}</span>
+          )}
+          {u.txid && (
+            <button
+              type="button"
+              onClick={copyId}
+              className="text-xs text-emerald-200/40 hover:text-keryx-green"
+            >
+              {copied ? "Copied ✓" : "copy"}
+            </button>
+          )}
+        </div>
+        {u.timestamp && (
+          <p className="mt-0.5 text-xs text-emerald-200/30">
+            {new Date(u.timestamp).toLocaleString()}
+          </p>
+        )}
+      </div>
+      <span className="shrink-0 font-mono text-sm font-semibold text-keryx-green">
+        +{formatKrxShort(u.amountSompi)} KRX
       </span>
     </li>
   );

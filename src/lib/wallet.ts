@@ -18,6 +18,9 @@ const SEED_BLOB_KEY = "keryx.wallet.seed.v1";
 // (already public on-chain) and amounts are stored — never keys or the seed. Cleared on a new
 // wallet (create/import) so it can't show another seed's activity.
 const LOCAL_ACTIVITY_KEY = "keryx.wallet.activity.v1";
+const RECEIVED_LOG_KEY = "keryx.wallet.received.v1";
+const RECEIVE_LIST_KEY = "keryx.wallet.receivelist.v1";
+const RECEIVE_ACTIVE_KEY = "keryx.wallet.receiveactive.v1";
 
 export interface NodeSettings {
   url: string;
@@ -54,6 +57,19 @@ export interface HistoryEntry {
   amountSompi: bigint;
   /** UNIX time in ms, if the SDK provided it. */
   timestamp?: number;
+  /** The account address this tx was sent FROM (for per-account filtering). */
+  fromAddress?: string;
+}
+
+/** One currently/previously received UTXO, surfaced as an incoming entry (per-account). */
+export interface ReceivedEntry {
+  txid: string;
+  index: number;
+  amountSompi: bigint;
+  timestamp?: number;
+  isCoinbase?: boolean;
+  /** The account address this deposit landed on (for per-account filtering). */
+  address?: string;
 }
 
 /** Result of an estimate: fee + total to spend (both sompi). */
@@ -83,15 +99,6 @@ function outpointKey(e: { outpoint?: { transactionId?: string; index?: number } 
 
 type Listener = () => void;
 
-// Map of TransactionDataType-ish strings to a coarse direction.
-const INCOMING_TYPES = new Set([
-  "incoming",
-  "external",
-  "transfer-incoming",
-  "change",
-]);
-const OUTGOING_TYPES = new Set(["outgoing", "transfer-outgoing", "batch"]);
-
 class WalletService {
   private wallet: kaspa.Wallet | null = null;
   private wasmReady = false;
@@ -106,6 +113,13 @@ class WalletService {
   nodeDaa: bigint | null = null; // node's virtual DAA score (tip), polled live
   hasUtxoIndex: boolean | null = null; // node started with --utxoindex? required for balances
   receiveAddress: string | null = null;
+  /** The user's chosen receive addresses (MetaMask-style switcher), capped at MAX_RECEIVE_ADDRESSES.
+   *  receiveAddress is whichever of these is currently selected. */
+  receiveAddresses: string[] = [];
+  static readonly MAX_RECEIVE_ADDRESSES = 3;
+  /** Public-key generator cached at open() (no private keys) so "My addresses" can derive + scan the
+   *  wallet's addresses WITHOUT asking for the password again. Dropped on lock. */
+  private pubGen: kaspa.PublicKeyGenerator | null = null;
   balance: WalletBalance = { mature: 0n, pending: 0n };
   lastError: string | null = null;
 
@@ -385,6 +399,21 @@ class WalletService {
       : null;
     this.gotBalanceEvent = false;
     this.accountAddresses = this.collectDescriptorAddresses(acc);
+    this.initReceiveList(); // restore the saved receive-address switcher list + active selection
+    // Cache the PUBLIC key generator (no private keys) so we can scan addresses later without the
+    // password. We have the password here; deriving the generator is local + fast. Non-fatal.
+    try {
+      const phrase = this.revealMnemonic(password);
+      const seed = new kaspa.Mnemonic(phrase).toSeed();
+      const xprv = new kaspa.XPrv(seed);
+      this.pubGen = kaspa.PublicKeyGenerator.fromMasterXPrv(
+        xprv.toString(),
+        false,
+        0n
+      );
+    } catch {
+      this.pubGen = null;
+    }
 
     // UNLOCK = walletOpen succeeded (the wallet is decrypted). That is LOCAL and fast. We must NOT
     // block the unlock on anything network-bound: connecting to the node, starting the processor,
@@ -530,7 +559,7 @@ class WalletService {
     if (this.accountAddresses.length === 0) return;
     try {
       const res = await this.wallet.rpc.getBalancesByAddresses(
-        this.accountAddresses
+        this.activeAddresses()
       );
       const entries = (res?.entries ?? []) as Array<{ balance?: bigint }>;
       let total = 0n;
@@ -748,6 +777,8 @@ class WalletService {
     this.accountAddresses = [];
     this._accountId = null;
     this.receiveAddress = null;
+    this.receiveAddresses = [];
+    this.pubGen = null;
     this.balance = { mature: 0n, pending: 0n };
     this.conn = "disconnected";
     this.synced = false;
@@ -832,26 +863,106 @@ class WalletService {
 
   // --- transactions / fees / addresses ---
 
+  /** Per-account incoming deposits (newest first). Records genuine incoming UTXOs (excluding our own
+   *  change) to localStorage as they appear, so the list is per-account and persists after spending. */
+  async receivedEntries(): Promise<ReceivedEntry[]> {
+    await this.syncReceivedLog();
+    const active = this.receiveAddress;
+    return this.readReceivedLog()
+      .filter((e) => (active ? e.address === active : true))
+      .sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
+  }
+
+  private async syncReceivedLog(): Promise<void> {
+    if (!this.wallet || this.accountAddresses.length === 0) return;
+    let entries: any[];
+    try {
+      entries = await this.fetchEntries();
+    } catch {
+      return;
+    }
+    const log = this.readReceivedLog();
+    const seen = new Set(log.map((e) => `${e.txid}:${e.index}`));
+    const ourTxids = new Set(this.readLocalActivity().map((a) => a.id)); // our sends → change
+    let changed = false;
+    const now = Date.now();
+    for (const e of entries) {
+      const txid = String(e.outpoint?.transactionId ?? "");
+      if (!txid) continue;
+      const index = Number(e.outpoint?.index ?? 0);
+      const key = `${txid}:${index}`;
+      if (seen.has(key)) continue;
+      if (ourTxids.has(txid)) continue; // our own change, not an incoming deposit
+      log.push({
+        txid,
+        index,
+        amountSompi: BigInt(e.amount ?? 0n),
+        timestamp: now,
+        isCoinbase: !!e.isCoinbase,
+        address: e.address ? String(e.address) : undefined,
+      });
+      seen.add(key);
+      changed = true;
+    }
+    if (changed) this.writeReceivedLog(log);
+  }
+
+  private readReceivedLog(): ReceivedEntry[] {
+    try {
+      const raw = localStorage.getItem(RECEIVED_LOG_KEY);
+      if (!raw) return [];
+      const arr = JSON.parse(raw) as Array<{
+        txid: string;
+        index: number;
+        amountSompi: string;
+        timestamp?: number;
+        isCoinbase?: boolean;
+        address?: string;
+      }>;
+      return arr.map((e) => ({
+        txid: e.txid,
+        index: e.index,
+        amountSompi: (() => {
+          try {
+            return BigInt(e.amountSompi);
+          } catch {
+            return 0n;
+          }
+        })(),
+        timestamp: e.timestamp,
+        isCoinbase: e.isCoinbase,
+        address: e.address,
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  private writeReceivedLog(log: ReceivedEntry[]): void {
+    try {
+      const serialized = log
+        .slice(-500)
+        .map((e) => ({ ...e, amountSompi: e.amountSompi.toString() }));
+      localStorage.setItem(RECEIVED_LOG_KEY, JSON.stringify(serialized));
+    } catch {
+      /* localStorage may be unavailable — non-fatal */
+    }
+  }
+
   /**
-   * Fetch recent transaction activity, normalized to HistoryEntry[].
-   * SDK: transactionsDataGet({ accountId, networkId, start, end }) → { transactions: ITransactionRecord[] }.
+   * Per-account "Sent": our own outgoing txs from the ACTIVE address only. We do NOT use the SDK's
+   * transactionsDataGet here — in this integration it returns account-wide records that can't be
+   * attributed per address (and is often empty), which made the list not change when switching
+   * accounts. Incoming is shown separately via receivedEntries (also per-account).
    */
   async history(limit = 50): Promise<HistoryEntry[]> {
     if (!this.wallet || !this._accountId) return [];
-    const res = await this.wallet.transactionsDataGet({
-      accountId: this._accountId,
-      networkId: this._networkId,
-      start: 0n,
-      end: BigInt(limit),
-    });
-    const fromStore = (res?.transactions ?? []).map((tx) => this.normalizeRecord(tx));
-    // Merge our locally-recorded sends/consolidates (which the SDK store never sees, see
-    // LOCAL_ACTIVITY_KEY). De-dupe by txid, preferring the store's record if both exist.
-    const seen = new Set(fromStore.map((e) => e.id).filter(Boolean));
-    const merged = [...fromStore, ...this.readLocalActivity().filter((e) => !seen.has(e.id))];
-    // Newest first; entries without a timestamp sink to the bottom.
-    merged.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
-    return merged.slice(0, limit);
+    const active = this.receiveAddress;
+    const local = this.readLocalActivity().filter((e) =>
+      active ? e.fromAddress === active : true
+    );
+    local.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
+    return local.slice(0, limit);
   }
 
   /**
@@ -1122,14 +1233,20 @@ class WalletService {
    * blockDaaScore, isCoinbase }. kaspa.d.ts: IUtxoEntry 853, TransactionOutpoint 7075 (transactionId
    * /index), ScriptPublicKey 6917 (version/script). entries accepts IUtxoEntry[] (2343).
    */
+  /** The address the wallet currently OPERATES on. In the per-account model this is just the active
+   *  (selected) receive address, so balance, sends and history are scoped to that one account. */
+  private activeAddresses(): string[] {
+    const a = this.receiveAddress ?? this.accountAddresses[0];
+    return a ? [a] : [];
+  }
+
   private async fetchEntries(): Promise<any[]> {
     if (!this.wallet) throw new Error("Wallet is locked.");
-    if (this.accountAddresses.length === 0) {
-      throw new Error("No addresses to scan for UTXOs.");
+    const scan = this.activeAddresses();
+    if (scan.length === 0) {
+      throw new Error("No active address to scan for UTXOs.");
     }
-    const res = await this.wallet.rpc.getUtxosByAddresses(
-      this.accountAddresses
-    );
+    const res = await this.wallet.rpc.getUtxosByAddresses(scan);
     const refs = (res?.entries ?? []) as any[];
     const mapped = refs.map((r) => {
       const op = r.outpoint ?? {};
@@ -1216,6 +1333,7 @@ class WalletService {
         direction: "out",
         amountSompi,
         timestamp: Date.now(),
+        fromAddress: this.receiveAddress ?? undefined,
       });
       return [txid];
     } finally {
@@ -1388,6 +1506,7 @@ class WalletService {
         direction: "other",
         amountSompi: swept,
         timestamp: Date.now(),
+        fromAddress: this.receiveAddress ?? undefined,
       });
 
       // Wait for the node to consume this batch's inputs before reading the set for the next one.
@@ -1438,10 +1557,10 @@ class WalletService {
    * — no signing, no state change on the wallet/node/chain.
    */
   async utxoStats(): Promise<{ count: number; totalSompi: bigint }> {
-    if (!this.wallet || this.accountAddresses.length === 0) {
+    if (!this.wallet || this.activeAddresses().length === 0) {
       return { count: 0, totalSompi: 0n };
     }
-    const res = await this.wallet.rpc.getUtxosByAddresses(this.accountAddresses);
+    const res = await this.wallet.rpc.getUtxosByAddresses(this.activeAddresses());
     const entries = (res?.entries ?? []) as Array<{ amount?: bigint }>;
     let total = 0n;
     for (const e of entries) {
@@ -1491,6 +1610,11 @@ class WalletService {
     if (!this.wallet || !this._accountId) {
       throw new Error("Wallet is locked.");
     }
+    if (this.receiveAddresses.length >= WalletService.MAX_RECEIVE_ADDRESSES) {
+      throw new Error(
+        `This wallet keeps up to ${WalletService.MAX_RECEIVE_ADDRESSES} addresses. Pick one from the list instead.`
+      );
+    }
     const res = await this.wallet.accountsCreateNewAddress({
       accountId: this._accountId,
       addressKind: kaspa.NewAddressKind.Receive,
@@ -1506,8 +1630,171 @@ class WalletService {
     if (addr && !this.accountAddresses.includes(addr)) {
       this.accountAddresses.push(addr);
     }
+    if (addr && !this.receiveAddresses.includes(addr)) {
+      this.receiveAddresses.push(addr);
+      this.receiveAddresses = this.receiveAddresses.slice(
+        0,
+        WalletService.MAX_RECEIVE_ADDRESSES
+      );
+    }
+    this.persistReceiveList();
     this.emit();
     return addr;
+  }
+
+  /** The receive addresses the user can switch between (MetaMask-style). */
+  getReceiveAddresses(): string[] {
+    return [...this.receiveAddresses];
+  }
+
+  /** Whether another address can still be created (under the cap). */
+  get canAddReceiveAddress(): boolean {
+    return this.receiveAddresses.length < WalletService.MAX_RECEIVE_ADDRESSES;
+  }
+
+  /** Make `addr` (one of the switcher addresses) the active receive address. Persisted. */
+  selectReceiveAddress(addr: string): void {
+    if (!this.receiveAddresses.includes(addr)) {
+      throw new Error("That address is not one of your wallet's addresses.");
+    }
+    this.receiveAddress = addr;
+    try {
+      localStorage.setItem(RECEIVE_ACTIVE_KEY, addr);
+    } catch {
+      /* non-fatal */
+    }
+    // Switching account → clear the previous account's balance and load this one's.
+    this.balance = { mature: 0n, pending: 0n };
+    this.emit();
+    void this.refreshBalanceFromUtxos();
+  }
+
+  /**
+   * List the wallet's accounts WITHOUT asking for the password. Derives receive+change addresses
+   * 0..depth from the cached public-key generator (set at open), reads each balance, and returns the
+   * ones that hold funds plus the managed/active addresses — MetaMask-style, no scan button. Funded
+   * addresses are adopted into the watched set so the balance includes them. Active first, then balance.
+   */
+  async listAccounts(depth = 30): Promise<
+    Array<{ address: string; balanceSompi: bigint; kind: "receive" | "change"; isActive: boolean }>
+  > {
+    if (!this.wallet) return [];
+    const cand: Array<{ address: string; kind: "receive" | "change" }> = [];
+    const push = (a: string, kind: "receive" | "change") => {
+      if (a && !cand.find((c) => c.address === a)) cand.push({ address: a, kind });
+    };
+    if (this.pubGen) {
+      try {
+        const r = this.pubGen.receiveAddressAsStrings(this._networkId, 0, depth);
+        const c = this.pubGen.changeAddressAsStrings(this._networkId, 0, depth);
+        r.forEach((a) => push(a, "receive"));
+        c.forEach((a) => push(a, "change"));
+      } catch {
+        /* fall through to the managed set */
+      }
+    }
+    this.receiveAddresses.forEach((a) => push(a, "receive"));
+    if (this.receiveAddress) push(this.receiveAddress, "receive");
+
+    const bal = new Map<string, bigint>();
+    try {
+      const res = await this.wallet.rpc.getBalancesByAddresses(cand.map((c) => c.address));
+      for (const e of (res?.entries ?? []) as Array<{ address?: any; balance?: bigint }>) {
+        const ad = e.address?.toString?.() ?? String(e.address ?? "");
+        let b = 0n;
+        try {
+          b = BigInt(e.balance ?? 0n);
+        } catch {
+          b = 0n;
+        }
+        bal.set(ad, b);
+      }
+    } catch {
+      /* node balances unavailable — still return addresses (balance 0) */
+    }
+
+    let adopted = false;
+    for (const c of cand) {
+      if ((bal.get(c.address) ?? 0n) > 0n && !this.accountAddresses.includes(c.address)) {
+        this.accountAddresses.push(c.address);
+        adopted = true;
+      }
+    }
+    if (adopted) this.emit();
+
+    const out = cand
+      .filter(
+        (c) =>
+          (bal.get(c.address) ?? 0n) > 0n ||
+          this.receiveAddresses.includes(c.address) ||
+          c.address === this.receiveAddress
+      )
+      .map((c) => ({
+        address: c.address,
+        balanceSompi: bal.get(c.address) ?? 0n,
+        kind: c.kind,
+        isActive: c.address === this.receiveAddress,
+      }));
+    out.sort((a, b) =>
+      a.isActive
+        ? -1
+        : b.isActive
+          ? 1
+          : b.balanceSompi > a.balanceSompi
+            ? 1
+            : b.balanceSompi < a.balanceSompi
+              ? -1
+              : 0
+    );
+    return out;
+  }
+
+  /** Switch to an account from the list — adopts it (managed + watched + signable) and makes it
+   *  active. Not subject to the create cap (you're viewing your own funds, not creating). */
+  useAccount(addr: string): void {
+    if (!addr) return;
+    if (!this.receiveAddresses.includes(addr)) {
+      this.receiveAddresses.push(addr);
+      this.persistReceiveList();
+    }
+    if (!this.accountAddresses.includes(addr)) this.accountAddresses.push(addr);
+    this.selectReceiveAddress(addr);
+  }
+
+  /** Load the saved switcher list + active selection on open; seed it with the index-0 address. */
+  private initReceiveList(): void {
+    let list: string[] = [];
+    try {
+      const raw = localStorage.getItem(RECEIVE_LIST_KEY);
+      if (raw) list = (JSON.parse(raw) as string[]).filter((s) => typeof s === "string");
+    } catch {
+      list = [];
+    }
+    if (list.length === 0 && this.receiveAddress) {
+      list = [this.receiveAddress];
+    }
+    this.receiveAddresses = list.slice(0, WalletService.MAX_RECEIVE_ADDRESSES);
+    for (const a of this.receiveAddresses) {
+      if (!this.accountAddresses.includes(a)) this.accountAddresses.push(a);
+    }
+    this.persistReceiveList();
+    let active: string | null = null;
+    try {
+      active = localStorage.getItem(RECEIVE_ACTIVE_KEY);
+    } catch {
+      active = null;
+    }
+    if (active && this.receiveAddresses.includes(active)) {
+      this.receiveAddress = active;
+    }
+  }
+
+  private persistReceiveList(): void {
+    try {
+      localStorage.setItem(RECEIVE_LIST_KEY, JSON.stringify(this.receiveAddresses));
+    } catch {
+      /* non-fatal */
+    }
   }
 
   /** Parse a user-entered KRX string to sompi (bigint). Throws on bad input. */
@@ -1547,6 +1834,7 @@ class WalletService {
         direction: HistoryEntry["direction"];
         amountSompi: string;
         timestamp?: number;
+        fromAddress?: string;
       }>;
       return arr.map((e) => ({
         id: e.id,
@@ -1560,6 +1848,7 @@ class WalletService {
           }
         })(),
         timestamp: e.timestamp,
+        fromAddress: e.fromAddress,
       }));
     } catch {
       return [];
@@ -1586,38 +1875,12 @@ class WalletService {
   private clearLocalActivity(): void {
     try {
       localStorage.removeItem(LOCAL_ACTIVITY_KEY);
+      localStorage.removeItem(RECEIVED_LOG_KEY);
+      localStorage.removeItem(RECEIVE_LIST_KEY);
+      localStorage.removeItem(RECEIVE_ACTIVE_KEY);
     } catch {
       /* non-fatal */
     }
-  }
-
-  private normalizeRecord(tx: any): HistoryEntry {
-    const type: string =
-      tx?.type ?? tx?.data?.type ?? "unknown";
-    // Prefer the top-level record value; fall back to the inner variant value.
-    const rawValue = tx?.value ?? tx?.data?.data?.value ?? 0n;
-    let amountSompi = 0n;
-    try {
-      amountSompi = BigInt(rawValue);
-    } catch {
-      amountSompi = 0n;
-    }
-    let timestamp: number | undefined;
-    const ms = tx?.unixtimeMsec;
-    if (ms !== undefined && ms !== null) {
-      try {
-        timestamp = Number(BigInt(ms));
-      } catch {
-        timestamp = undefined;
-      }
-    }
-    const lower = String(type).toLowerCase();
-    const direction: HistoryEntry["direction"] = INCOMING_TYPES.has(lower)
-      ? "in"
-      : OUTGOING_TYPES.has(lower)
-      ? "out"
-      : "other";
-    return { id: tx?.id ?? "", type: lower, direction, amountSompi, timestamp };
   }
 
   private ensureWallet() {
@@ -1697,4 +1960,19 @@ export function formatKrx(sompi: bigint): string {
     const frac = (sompi % 100000000n).toString().padStart(8, "0");
     return `${whole}.${frac}`;
   }
+}
+
+/** Display-only KRX: thousands separators + at most 4 decimals (trailing zeros trimmed), TRUNCATED
+ *  (never rounds up). Use for balances/lists where space is tight; use formatKrx for exact amounts. */
+export function formatKrxShort(sompi: bigint): string {
+  const neg = sompi < 0n;
+  const v = neg ? -sompi : sompi;
+  const whole = v / 100000000n;
+  const frac = (v % 100000000n)
+    .toString()
+    .padStart(8, "0")
+    .slice(0, 4)
+    .replace(/0+$/, "");
+  const wholeStr = whole.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return (neg ? "-" : "") + wholeStr + (frac ? "." + frac : "");
 }

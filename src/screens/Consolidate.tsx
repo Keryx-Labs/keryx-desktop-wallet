@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { wallet, formatKrx } from "../lib/wallet";
+import { wallet, formatKrxShort } from "../lib/wallet";
 
 type Stats = { count: number; totalSompi: bigint };
 
@@ -126,7 +126,7 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
           {stats && (
             <div className="mt-1 flex items-center justify-between text-[11px] text-emerald-200/40">
               <span>Total</span>
-              <span className="font-mono">{formatKrx(stats.totalSompi)} KRX</span>
+              <span className="font-mono">{formatKrxShort(stats.totalSompi)} KRX</span>
             </div>
           )}
           {(txids || (startCount != null && startCount > 1)) && (

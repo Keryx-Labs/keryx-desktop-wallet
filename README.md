@@ -8,6 +8,13 @@ Your keys never leave your device. The recovery phrase is encrypted at rest, and
   <img src="docs/screenshots/welcome.png" alt="Keryx Wallet — welcome screen" width="640">
 </p>
 
+## Download
+
+Prebuilt binaries are attached to each [GitHub Release](../../releases):
+
+- **Windows:** `.msi` or `.exe` installer, or the standalone **portable** `.exe` (no install — just run it).
+- **Linux:** `.deb` or `.AppImage`.
+
 ## Features
 
 - **Create or import** a wallet from a 24-word recovery phrase, with on-screen backup confirmation.
@@ -69,6 +76,15 @@ ecosystem. Regenerating the SDK from a newer node release is documented in `SDK_
   destination address and network beforehand.
 - A strict Content Security Policy blocks remote content and inline/eval scripts, and Tauri capabilities
   are limited to the defaults.
+
+## Support the project
+
+Keryx Wallet is free and open source. If it's useful to you and you'd like to help its
+development, donations are very welcome — thank you!
+
+- **KRX (Keryx):** `keryx:qpx2alq86yev9xs3jqf3endplycf27vq3qxf7gaxvxnedacnl7y0xyvwq3slp`
+- **USDT / USDC (EVM — Ethereum, BNB Chain, and other EVM networks):** `0xe5c66e65a5b2085e5313796dd2a1C90aB276cD8d`
+  _(EVM / ERC-20 / BEP-20 tokens only — do not send from non-EVM chains.)_
 
 ## License
 

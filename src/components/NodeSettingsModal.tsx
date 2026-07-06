@@ -3,6 +3,16 @@ import { NodeSettings, wallet } from "../lib/wallet";
 
 const DEFAULT_PORT = "23110"; // Keryx Borsh wRPC default
 
+// Plaintext ws:// is only safe to a loopback host; a remote node must use wss://.
+// The CSP enforces the same rule (connect-src allows ws: only for loopback), so a
+// remote ws:// would silently fail to connect — we block it here with a clear message.
+function isLoopbackHost(h: string): boolean {
+  const host = h.trim().toLowerCase();
+  // Keep this in lockstep with the CSP connect-src (loopback = plaintext ws OK).
+  // IPv6 loopback isn't listed: use "localhost", which the CSP allows by name.
+  return host === "127.0.0.1" || host === "localhost";
+}
+
 // Split a stored "ws://host:port" URL back into its parts for the editable fields.
 function splitUrl(u: string): { secure: boolean; host: string; port: string } {
   const secure = /^wss:\/\//i.test(u);
@@ -32,7 +42,9 @@ export function NodeSettingsModal({
   const cleanPort = (port.trim() || DEFAULT_PORT).replace(/[^0-9]/g, "");
   const builtUrl = `${secure ? "wss" : "ws"}://${cleanHost}:${cleanPort}`;
   const previewUrl = `${secure ? "wss" : "ws"}://${cleanHost || "…"}:${cleanPort}`;
-  const valid = cleanHost.length > 0 && cleanPort.length > 0;
+  const loopback = isLoopbackHost(cleanHost);
+  const insecureRemote = !secure && cleanHost.length > 0 && !loopback;
+  const valid = cleanHost.length > 0 && cleanPort.length > 0 && !insecureRemote;
 
   async function testConnection() {
     setTestMsg(null);
@@ -92,6 +104,12 @@ export function NodeSettingsModal({
           />
           Secure (wss) — only if your node has TLS
         </label>
+        {insecureRemote && (
+          <p className="mb-3 text-xs text-amber-300">
+            Remote nodes require a secure connection. Enable “Secure (wss)”, or run
+            a local node at 127.0.0.1 (e.g. via an SSH tunnel).
+          </p>
+        )}
         <p className="mb-3 text-xs text-emerald-200/40">
           Connects to <span className="font-mono text-keryx-green/70">{previewUrl}</span>.
           The node must run with <span className="font-mono">--utxoindex</span>.
