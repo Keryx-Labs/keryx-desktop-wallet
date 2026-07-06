@@ -1,8 +1,14 @@
 name: release
 
-# Builds Keryx Wallet installers for Windows + Linux and attaches them to a GitHub Release.
-# Trigger by pushing a version tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`),
+# Builds Keryx Wallet installers (Windows + Linux) plus a Windows portable .exe and attaches
+# them ALL to a SINGLE draft GitHub Release.
+# Trigger by pushing a version tag (e.g. `git tag v0.1.1 && git push origin v0.1.1`),
 # or run manually from the Actions tab.
+#
+# A dedicated `create-release` job makes the draft release ONCE and passes its id to the build
+# matrix (via tauri-action's `releaseId`), so the two platform jobs upload to the same release
+# instead of each racing to create their own draft — which used to produce duplicate drafts.
+# The release is left as a DRAFT for manual review + publish.
 #
 # The WASM wallet SDK (src/sdk/) is committed, so CI does NOT rebuild it (no clang/wasm-pack
 # needed) — it only builds the Tauri shell + bundles the prebuilt dist.
@@ -17,12 +23,40 @@ permissions:
   contents: write   # needed to create the Release and upload artifacts
 
 jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.mk.outputs.release_id }}
+      release_tag: ${{ steps.mk.outputs.release_tag }}
+    steps:
+      - name: Create the draft release (once)
+        id: mk
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const isTag = context.ref.startsWith('refs/tags/');
+            const tag = isTag
+              ? context.ref.replace('refs/tags/', '')
+              : `v0.0.0-dev-${context.runNumber}`;
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: `Keryx Wallet ${tag}`,
+              body: 'Keryx Wallet installers. Verify checksums before installing.',
+              draft: true,
+              prerelease: false,
+            });
+            core.setOutput('release_id', String(data.id));
+            core.setOutput('release_tag', tag);
+
   build:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: windows-latest   # → .msi (WiX) + .exe (NSIS)
+          - platform: windows-latest   # → .msi (WiX) + .exe (NSIS) + portable .exe
           - platform: ubuntu-22.04      # → .deb + .AppImage (+ .rpm)
     runs-on: ${{ matrix.platform }}
 
@@ -57,13 +91,28 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
-      - name: Build + bundle (Tauri)
+      - name: Build + bundle (Tauri) → upload to the shared release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || format('v0.0.0-dev-{0}', github.run_number) }}
-          releaseName: "Keryx Wallet ${{ github.ref_type == 'tag' && github.ref_name || 'dev build' }}"
-          releaseBody: "Keryx Wallet installers. Verify checksums before installing."
-          releaseDraft: true
-          prerelease: false
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+
+      # The portable is a special --features portable --no-bundle build, so tauri-action
+      # doesn't emit it. Build it natively on the Windows runner and attach it by release id.
+      - name: Build Windows portable + attach to the release
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        run: |
+          npm run tauri build -- --features portable --no-bundle
+          VER=$(node -p "require('./package.json').version")
+          OUT="Keryx.Wallet_${VER}_x64_portable.exe"
+          cp "src-tauri/target/release/keryx-wallet.exe" "$OUT"
+          curl -sSf -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @"$OUT" \
+            "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?name=${OUT}"

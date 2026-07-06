@@ -57,8 +57,8 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-- Windows: `.msi` (WiX) and `.exe` (NSIS). Linux: `.deb` and `.AppImage`.
-- See `.github/workflows/release.yml`. The release is created as a draft — review and publish manually.
+- Windows: `.msi` (WiX), `.exe` (NSIS) installer, and a standalone portable `.exe`. Linux: `.deb` and `.AppImage`.
+- All artifacts land on a single draft Release. See `.github/workflows/release.yml` — the release is created as a draft, so review and publish it manually.
 
 ## Architecture
 
