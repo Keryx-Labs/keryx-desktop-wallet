@@ -57,6 +57,17 @@ const STORAGE_MASS_PARAMETER = 1_000_000_000_000n; // 1e12
 const MASS_BUDGET = 80_000n; // headroom below the 100_000 standard limit
 const COINBASE_MATURITY = 1000;
 
+// "Private" livefeed marker.
+// Desktop-wallet requests should not surface on the public inference livefeed
+// (keryx-api /api/v1/infer). The node offers no field to tag a request, so we
+// carve an extra self-send output[2] that the miner ignores (it only reads the
+// payload + escrow output[1]) and the node accepts (extra outputs beyond the
+// escrow are allowed). keryx-api recognises an AiRequest carrying >2 outputs as
+// wallet-originated and keeps it off the feed. The value is change back to the
+// requester — NOT a cost — sized to stay under the KIP-9 mass budget.
+// This is cosmetic (the tx is still on-chain and inspectable), not privacy.
+export const PRIVATE_MARKER_SOMPI = 50_000_000n; // 0.5 KRX, self-send (reclaimable)
+
 // ---------------------------------------------------------------------------
 // Model registry (post-H2 OPoI v2 lineup) — model_id + base inference_reward.
 // Values verified against INFERENCE_REWARD_MINIMUMS_V2_H2 in the node params.
@@ -226,8 +237,10 @@ export interface RequestUtxo {
 export interface SelectedUtxos {
   selected: RequestUtxo[];
   totalIn: bigint;
-  /** change value for output[0]; 0 means the change is folded into the fee. */
+  /** change value for output[0] (already net of the private marker, if any). */
   changeSompi: bigint;
+  /** value of the extra self-send marker output[2]; 0 when not private. */
+  markerSompi: bigint;
   dropChange: boolean;
 }
 
@@ -235,12 +248,17 @@ export interface SelectedUtxos {
  * Select mature UTXOs (largest first) until the change output is large enough
  * that the KIP-9 storage mass stays under the standard limit. Mirrors the
  * pooling logic of the ecosystem builder. `totalNeeded = priorityFee + reward`.
+ *
+ * `markerSompi > 0` (private mode) carves a self-send output[2] out of the
+ * change: the change (output[0]) becomes `totalIn - needed - marker`, and the
+ * mass budget must cover output[0] + escrow + the marker together.
  */
 export function selectUtxosForRequest(
   utxos: RequestUtxo[],
   priorityFee: bigint,
   inferenceReward: bigint,
   currentDaaScore: bigint,
+  markerSompi: bigint = 0n,
 ): SelectedUtxos {
   const candidates = utxos
     .filter(
@@ -254,35 +272,43 @@ export function selectUtxosForRequest(
     )
     .sort((a, b) => (b.amountSompi > a.amountSompi ? 1 : -1));
 
-  const totalNeeded = priorityFee + inferenceReward;
+  // What actually leaves the wallet: the burned fee + the escrowed reward. The
+  // private marker is a self-send, so it stays with the requester but must be
+  // carved out of the change (output[0] = totalIn - leavesWallet - marker).
+  const leavesWallet = priorityFee + inferenceReward;
   const escrowMass =
     inferenceReward > 0n ? STORAGE_MASS_PARAMETER / inferenceReward : 0n;
+  const markerMass =
+    markerSompi > 0n ? STORAGE_MASS_PARAMETER / markerSompi : 0n;
 
   const selected: RequestUtxo[] = [];
   let totalIn = 0n;
   for (const c of candidates) {
     selected.push(c);
     totalIn += c.amountSompi;
-    const change = totalIn - totalNeeded;
+    const change = totalIn - leavesWallet - markerSompi;
     if (change <= 0n) continue;
-    if (STORAGE_MASS_PARAMETER / change + escrowMass <= MASS_BUDGET) break;
+    if (
+      STORAGE_MASS_PARAMETER / change + escrowMass + markerMass <=
+      MASS_BUDGET
+    )
+      break;
   }
 
-  if (totalIn <= totalNeeded) {
+  const changeSompi = totalIn - leavesWallet - markerSompi;
+  if (changeSompi <= 0n) {
     throw new Error(
-      `Insufficient funds: need more than ${totalNeeded} sompi (have ${totalIn})`,
+      `Insufficient funds: need more than ${leavesWallet + markerSompi} sompi (have ${totalIn})`,
     );
   }
 
-  let changeSompi = totalIn - totalNeeded;
-  // Last resort: a dust change that would breach the mass limit is folded into
-  // the fee. NOTE: consensus hard-requires outputs[1] = escrow, so we must keep
-  // a real output[0]; dropping change would move the escrow to index 0 and be
-  // rejected (AiRequestMissingEscrowOutput). We therefore never drop the change
-  // when an escrow is present — instead the caller should pool more UTXOs.
+  // A dust change that would breach the mass limit cannot be folded into the
+  // fee: consensus hard-requires outputs[1] = escrow, so output[0] must stay
+  // real (dropping it would move the escrow to index 0 → AiRequestMissingEscrow-
+  // Output). The caller must pool more/larger UTXOs instead.
   const dropChange =
     inferenceReward > 0n &&
-    STORAGE_MASS_PARAMETER / changeSompi + escrowMass > MASS_BUDGET;
+    STORAGE_MASS_PARAMETER / changeSompi + escrowMass + markerMass > MASS_BUDGET;
   if (dropChange) {
     throw new Error(
       "change would be dust under the storage-mass limit; pool more/larger UTXOs " +
@@ -290,7 +316,7 @@ export function selectUtxosForRequest(
     );
   }
 
-  return { selected, totalIn, changeSompi, dropChange: false };
+  return { selected, totalIn, changeSompi, markerSompi, dropChange: false };
 }
 
 export interface BuildAiRequestTxArgs extends AiRequestFields {
@@ -301,6 +327,13 @@ export interface BuildAiRequestTxArgs extends AiRequestFields {
   minerEscrowPubkeyHex: string;
   /** Current virtual DAA score, for coinbase maturity filtering. */
   currentDaaScore: bigint;
+  /**
+   * Keep this request off the public inference livefeed. Adds a self-send
+   * output[2] (change back to the requester) that keryx-api recognises to
+   * exclude the request from /api/v1/infer. Cosmetic, not confidential.
+   * Desktop-wallet requests default to private.
+   */
+  isPrivate?: boolean;
 }
 
 /** Minimal SDK surface this builder needs (subset of the WASM module). */
@@ -328,15 +361,31 @@ export function buildAiRequestTx(
     );
   }
   const payload = encodeAiRequestPayload(args);
-  const { selected, changeSompi } = selectUtxosForRequest(
+  const marker = args.isPrivate ? PRIVATE_MARKER_SOMPI : 0n;
+  const { selected, changeSompi, markerSompi } = selectUtxosForRequest(
     args.utxos,
     args.priorityFee,
     args.inferenceReward,
     args.currentDaaScore,
+    marker,
   );
 
   const changeScript = kaspa.payToAddressScript(args.changeAddress);
+  const changeSpk = { version: changeScript.version, script: changeScript.script };
   const escrowScriptHex = buildEscrowScript(args.minerEscrowPubkeyHex);
+
+  const outputs = [
+    // output[0] = change → requester
+    { value: changeSompi, scriptPublicKey: changeSpk },
+    // output[1] = escrow → miner (CSV-P2PK)
+    { value: args.inferenceReward, scriptPublicKey: { version: 0, script: escrowScriptHex } },
+  ];
+  // output[2] = private-livefeed marker: a self-send back to the requester that
+  // keryx-api uses to keep the request off the public feed. Reclaimable change,
+  // ignored by the miner. See PRIVATE_MARKER_SOMPI.
+  if (markerSompi > 0n) {
+    outputs.push({ value: markerSompi, scriptPublicKey: changeSpk });
+  }
 
   const itx = {
     version: 0,
@@ -354,15 +403,7 @@ export function buildAiRequestTx(
         outpoint: { transactionId: u.transactionId, index: u.index },
       },
     })),
-    outputs: [
-      // output[0] = change → requester
-      {
-        value: changeSompi,
-        scriptPublicKey: { version: changeScript.version, script: changeScript.script },
-      },
-      // output[1] = escrow → miner (CSV-P2PK)
-      { value: args.inferenceReward, scriptPublicKey: { version: 0, script: escrowScriptHex } },
-    ],
+    outputs,
     lockTime: 0n,
     subnetworkId: SUBNETWORK_ID_AI_REQUEST_HEX,
     gas: 0n,
