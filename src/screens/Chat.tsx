@@ -8,19 +8,9 @@ import {
   MIN_AI_REQUEST_PRIORITY_FEE,
 } from "../lib/aiRequest";
 
-// Token budgets offered in the UI. The reward scales with this (0.05 KRX / 64).
 const TOKEN_PRESETS = [128, 256, 512] as const;
 const DEFAULT_MODEL: ModelName = "qwen3-1.7b";
 const DEFAULT_MAX_TOKENS = 256;
-
-type ChatMessage =
-  | { role: "user"; text: string; model: ModelName; totalSompi: bigint }
-  | {
-      role: "assistant";
-      status: "pending" | "done" | "error";
-      text: string | null;
-      note?: string;
-    };
 
 const MODEL_ORDER: ModelName[] = [
   "qwen3-1.7b",
@@ -30,22 +20,32 @@ const MODEL_ORDER: ModelName[] = [
   "llama-3.3-70b-q2",
 ];
 
+type ChatMessage =
+  | { role: "user"; text: string; model: ModelName; totalSompi: bigint }
+  | {
+      role: "assistant";
+      status: "pending" | "submitted" | "error";
+      txId: string | null;
+      note?: string;
+    };
+
 export function Chat({ onClose }: { onClose: () => void }) {
   const w = useWalletState();
 
   const [model, setModel] = useState<ModelName>(DEFAULT_MODEL);
   const [maxTokens, setMaxTokens] = useState<number>(DEFAULT_MAX_TOKENS);
   const [prompt, setPrompt] = useState("");
+  const [password, setPassword] = useState(""); // kept for this chat session only
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [messages]);
 
-  // --- cost, computed from the same constants the node enforces ---
+  // Cost = reward (escrow → miner) + fee (burned). Computed from the node-enforced
+  // minimums. The private-marker output is a self-send, so it is NOT a cost.
   const rewardSompi = computeInferenceReward(MODELS[model].baseRewardSompi, maxTokens);
   const feeSompi = MIN_AI_REQUEST_PRIORITY_FEE;
   const totalSompi = rewardSompi + feeSompi;
@@ -53,28 +53,51 @@ export function Chat({ onClose }: { onClose: () => void }) {
   const connected = w.conn === "connected" && w.synced;
   const hasFunds = w.balance.mature > totalSompi;
   const canSend =
-    connected && hasFunds && !busy && prompt.trim().length > 0 && wallet.isOpen;
+    connected &&
+    hasFunds &&
+    !busy &&
+    wallet.isOpen &&
+    prompt.trim().length > 0 &&
+    password.length > 0;
 
   async function send() {
-    setErr(null);
     if (!canSend) return;
     const text = prompt.trim();
+    const pw = password;
+    const model_ = model;
+    const maxTokens_ = maxTokens;
+    const cost = totalSompi;
     setPrompt("");
     setMessages((m) => [
       ...m,
-      { role: "user", text, model, totalSompi },
-      { role: "assistant", status: "pending", text: null },
+      { role: "user", text, model: model_, totalSompi: cost },
+      { role: "assistant", status: "pending", txId: null },
     ]);
     setBusy(true);
     try {
-      const answer = await runInference({ prompt: text, model, maxTokens });
-      setMessages((m) => replaceLastAssistant(m, { role: "assistant", status: "done", text: answer }));
+      // 1) find an active miner serving this model (wRPC coinbase scan)
+      const escrows = await wallet.fetchModelEscrowPubkeys(MODELS[model_].modelIdHex);
+      if (escrows.length === 0) {
+        throw new Error(
+          "No miner is currently serving this model. Try another model.",
+        );
+      }
+      // 2) build + sign + submit the (private) AiRequest
+      const { txId } = await wallet.submitInference(pw, {
+        model: model_,
+        prompt: text,
+        maxTokens: maxTokens_,
+        minerEscrowPubkeyHex: escrows[0],
+      });
+      setMessages((m) =>
+        replaceLastAssistant(m, { role: "assistant", status: "submitted", txId }),
+      );
     } catch (e) {
       setMessages((m) =>
         replaceLastAssistant(m, {
           role: "assistant",
           status: "error",
-          text: null,
+          txId: null,
           note: e instanceof Error ? e.message : "Request failed.",
         }),
       );
@@ -133,8 +156,9 @@ export function Chat({ onClose }: { onClose: () => void }) {
       {/* guardrails */}
       <div className="space-y-1 border-b border-keryx-border bg-black/20 px-5 py-2 text-[11px] leading-snug text-emerald-200/50">
         <p>
-          ⚠️ <b>Public:</b> your prompt is written on-chain and the answer is
-          stored on IPFS — anyone can read both. No private messaging yet.
+          ⚠️ <b>On-chain &amp; readable:</b> your prompt is written on-chain and the
+          answer is stored on IPFS. Your wallet marks these to stay off the public
+          inference feed, but they are not encrypted — not private messaging.
         </p>
         <p>
           ⚠️ <b>Optimistic:</b> answers are served under a challenge window, not
@@ -156,7 +180,6 @@ export function Chat({ onClose }: { onClose: () => void }) {
 
       {/* composer */}
       <div className="border-t border-keryx-border px-5 py-3">
-        {err && <p className="mb-2 text-xs text-red-400">{err}</p>}
         <div className="mb-2 flex items-center justify-between text-[11px] text-emerald-200/50">
           <span>
             Cost:{" "}
@@ -171,13 +194,20 @@ export function Chat({ onClose }: { onClose: () => void }) {
             balance {formatKrx(w.balance.mature)} KRX
           </span>
         </div>
+        <input
+          type="password"
+          className="input mb-2"
+          placeholder="Wallet password (to sign the request)"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          disabled={busy}
+          autoComplete="off"
+        />
         <div className="flex items-end gap-2">
           <textarea
             className="input min-h-[3rem] flex-1 resize-none"
             rows={2}
-            placeholder={
-              connected ? "Type your prompt…" : "Connect to a node to ask…"
-            }
+            placeholder={connected ? "Type your prompt…" : "Connect to a node to ask…"}
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
             onKeyDown={(e) => {
@@ -225,11 +255,21 @@ function Bubble({ msg }: { msg: ChatMessage }) {
       <div className="max-w-[80%] rounded-2xl rounded-bl-sm border border-keryx-border bg-black/30 px-4 py-2">
         {msg.status === "pending" && (
           <p className="animate-pulse text-sm text-emerald-200/50">
-            waiting for a miner…
+            finding a miner &amp; submitting…
           </p>
         )}
-        {msg.status === "done" && (
-          <p className="whitespace-pre-wrap text-sm text-emerald-100/90">{msg.text}</p>
+        {msg.status === "submitted" && (
+          <div className="text-sm text-emerald-100/90">
+            <p>Request submitted ✓ — a miner will post the answer on-chain.</p>
+            {msg.txId && (
+              <p className="mt-1 font-mono text-[10px] text-emerald-200/40">
+                tx {msg.txId.slice(0, 10)}…{msg.txId.slice(-6)}
+              </p>
+            )}
+            <p className="mt-1 text-[11px] text-emerald-200/40">
+              Answer retrieval is coming next.
+            </p>
+          </div>
         )}
         {msg.status === "error" && (
           <p className="text-sm text-red-300">{msg.note ?? "Request failed."}</p>
@@ -239,10 +279,7 @@ function Bubble({ msg }: { msg: ChatMessage }) {
   );
 }
 
-function replaceLastAssistant(
-  msgs: ChatMessage[],
-  next: ChatMessage,
-): ChatMessage[] {
+function replaceLastAssistant(msgs: ChatMessage[], next: ChatMessage): ChatMessage[] {
   const out = [...msgs];
   for (let i = out.length - 1; i >= 0; i--) {
     if (out[i].role === "assistant") {
@@ -251,17 +288,4 @@ function replaceLastAssistant(
     }
   }
   return out;
-}
-
-// --- integration seam ---
-// The on-chain flow (build AiRequest via lib/aiRequest → submit over wRPC →
-// poll for the AiResponse → fetch the result from IPFS) lands here in the next
-// step (lib/inferenceClient). Until then this reports that submission is not
-// wired, rather than fabricating an answer.
-async function runInference(_args: {
-  prompt: string;
-  model: ModelName;
-  maxTokens: number;
-}): Promise<string> {
-  throw new Error("On-chain submission is not wired yet (data layer next).");
 }
