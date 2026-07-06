@@ -23,11 +23,13 @@ function splitUrl(u: string): { secure: boolean; host: string; port: string } {
 
 export function NodeSettingsModal({
   initial,
+  initialAutoLockMinutes,
   onSave,
   onClose,
 }: {
   initial: NodeSettings;
-  onSave: (s: NodeSettings) => void;
+  initialAutoLockMinutes: number;
+  onSave: (s: NodeSettings, autoLockMinutes: number) => void;
   onClose: () => void;
 }) {
   const init0 = splitUrl(initial.url);
@@ -35,6 +37,7 @@ export function NodeSettingsModal({
   const [port, setPort] = useState(init0.port);
   const [secure, setSecure] = useState(init0.secure);
   const [networkId, setNetworkId] = useState(initial.networkId);
+  const [autoLockMinutes, setAutoLockMinutes] = useState(String(initialAutoLockMinutes));
   const [testing, setTesting] = useState(false);
   const [testMsg, setTestMsg] = useState<{ ok: boolean; text: string } | null>(null);
 
@@ -45,6 +48,10 @@ export function NodeSettingsModal({
   const loopback = isLoopbackHost(cleanHost);
   const insecureRemote = !secure && cleanHost.length > 0 && !loopback;
   const valid = cleanHost.length > 0 && cleanPort.length > 0 && !insecureRemote;
+  const cleanAutoLockMinutes = Math.max(
+    0,
+    Math.min(1440, Math.floor(Number(autoLockMinutes) || 0))
+  );
 
   async function testConnection() {
     setTestMsg(null);
@@ -143,6 +150,21 @@ export function NodeSettingsModal({
           <option value="testnet-11">testnet-11</option>
           <option value="simnet">simnet</option>
         </select>
+
+        <label className="label">Auto-lock timeout</label>
+        <select
+          className="input mb-4"
+          value={autoLockMinutes}
+          onChange={(e) => setAutoLockMinutes(e.target.value)}
+        >
+          <option value="1">1 minute</option>
+          <option value="5">5 minutes</option>
+          <option value="15">15 minutes</option>
+          <option value="30">30 minutes</option>
+          <option value="60">1 hour</option>
+          <option value="240">4 hours</option>
+          <option value="0">Never</option>
+        </select>
         <div className="mb-6 flex justify-end gap-2">
           <button className="btn-ghost" onClick={onClose}>
             Close
@@ -154,10 +176,10 @@ export function NodeSettingsModal({
               onSave({
                 url: `${secure ? "wss" : "ws"}://${cleanHost}:${cleanPort}`,
                 networkId,
-              })
+              }, cleanAutoLockMinutes)
             }
           >
-            Save node
+            Save settings
           </button>
         </div>
 

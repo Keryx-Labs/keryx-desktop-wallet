@@ -24,7 +24,7 @@ export function Header({
         <ConnectionBadge conn={conn} synced={synced} />
         {onSettings && (
           <button onClick={onSettings} className="btn-ghost px-3 py-1.5 text-xs">
-            Node
+            Settings
           </button>
         )}
         {onLock && (
