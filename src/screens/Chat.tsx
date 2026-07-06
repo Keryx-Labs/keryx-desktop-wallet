@@ -24,10 +24,18 @@ type ChatMessage =
   | { role: "user"; text: string; model: ModelName; totalSompi: bigint }
   | {
       role: "assistant";
-      status: "pending" | "submitted" | "error";
+      status: "pending" | "submitted" | "answered" | "error";
       txId: string | null;
       note?: string;
+      reqHash?: string;
+      cursor?: string;
+      cidUrl?: string;
+      attempts?: number;
     };
+
+// ~6s poll interval × MAX_POLLS ≈ 5 min before we stop watching for the answer.
+const POLL_MS = 6000;
+const MAX_POLLS = 50;
 
 export function Chat({ onClose }: { onClose: () => void }) {
   const w = useWalletState();
@@ -43,6 +51,39 @@ export function Chat({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [messages]);
+
+  // Poll the chain for each submitted request's on-chain answer (wRPC). Reads the
+  // latest messages via a ref so the interval isn't torn down on every update.
+  const messagesRef = useRef<ChatMessage[]>([]);
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+  useEffect(() => {
+    const id = setInterval(async () => {
+      const snapshot = messagesRef.current;
+      for (let i = 0; i < snapshot.length; i++) {
+        const m = snapshot[i];
+        if (m.role !== "assistant" || m.status !== "submitted" || !m.reqHash) continue;
+        if ((m.attempts ?? 0) >= MAX_POLLS) continue;
+        try {
+          const { result, cursorHash } = await wallet.pollInferenceResult(
+            m.reqHash,
+            m.cursor ?? "",
+          );
+          setMessages((cur) =>
+            cur.map((x, j) => {
+              if (j !== i || x.role !== "assistant") return x;
+              if (result) return { ...x, status: "answered", cidUrl: result.url };
+              return { ...x, cursor: cursorHash, attempts: (x.attempts ?? 0) + 1 };
+            }),
+          );
+        } catch {
+          /* transient RPC error — retry next tick */
+        }
+      }
+    }, POLL_MS);
+    return () => clearInterval(id);
+  }, []);
 
   // Cost = reward (escrow → miner) + fee (burned). Computed from the node-enforced
   // minimums. The private-marker output is a self-send, so it is NOT a cost.
@@ -83,14 +124,21 @@ export function Chat({ onClose }: { onClose: () => void }) {
         );
       }
       // 2) build + sign + submit the (private) AiRequest
-      const { txId } = await wallet.submitInference(pw, {
+      const { txId, requestHashHex, cursorHash } = await wallet.submitInference(pw, {
         model: model_,
         prompt: text,
         maxTokens: maxTokens_,
         minerEscrowPubkeyHex: escrows[0],
       });
       setMessages((m) =>
-        replaceLastAssistant(m, { role: "assistant", status: "submitted", txId }),
+        replaceLastAssistant(m, {
+          role: "assistant",
+          status: "submitted",
+          txId,
+          reqHash: requestHashHex,
+          cursor: cursorHash,
+          attempts: 0,
+        }),
       );
     } catch (e) {
       setMessages((m) =>
@@ -260,14 +308,37 @@ function Bubble({ msg }: { msg: ChatMessage }) {
         )}
         {msg.status === "submitted" && (
           <div className="text-sm text-emerald-100/90">
-            <p>Request submitted ✓ — a miner will post the answer on-chain.</p>
+            <p className="animate-pulse text-emerald-200/60">
+              Submitted ✓ — waiting for the miner's answer…
+            </p>
             {msg.txId && (
               <p className="mt-1 font-mono text-[10px] text-emerald-200/40">
                 tx {msg.txId.slice(0, 10)}…{msg.txId.slice(-6)}
               </p>
             )}
-            <p className="mt-1 text-[11px] text-emerald-200/40">
-              Answer retrieval is coming next.
+            {(msg.attempts ?? 0) >= MAX_POLLS && (
+              <p className="mt-1 text-[11px] text-amber-300/70">
+                Still no answer after a few minutes — the miner may be slow or
+                offline. The request stays valid on-chain.
+              </p>
+            )}
+          </div>
+        )}
+        {msg.status === "answered" && (
+          <div className="text-sm text-emerald-100/90">
+            <p>Answer ready ✓</p>
+            {msg.cidUrl && (
+              <a
+                href={msg.cidUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="mt-1 inline-block text-keryx-green underline hover:text-emerald-300"
+              >
+                Open answer ↗
+              </a>
+            )}
+            <p className="mt-1 text-[10px] text-emerald-200/30">
+              (opens the result on IPFS in your browser)
             </p>
           </div>
         )}

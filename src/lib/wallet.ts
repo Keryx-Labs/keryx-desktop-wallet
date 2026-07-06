@@ -6,12 +6,19 @@ import wasmUrl from "../sdk/kaspa_bg.wasm?url";
 import {
   buildAiRequestTx,
   computeInferenceReward,
+  encodeAiRequestPayload,
   MODELS,
   ModelName,
   RequestUtxo,
   MIN_AI_REQUEST_PRIORITY_FEE,
 } from "./aiRequest";
 import { escrowForModel } from "./aiCaps";
+import {
+  aiRequestHashHex,
+  parseAiResponse,
+  ipfsUrl,
+  SUBNETWORK_ID_AI_RESPONSE_HEX,
+} from "./aiResponse";
 
 const WALLET_FILENAME = "main";
 const WALLET_TITLE = "Keryx";
@@ -1373,7 +1380,13 @@ class WalletService {
       minerEscrowPubkeyHex: string;
       priorityFeeSompi?: bigint;
     },
-  ): Promise<{ txId: string; rewardSompi: bigint; feeSompi: bigint }> {
+  ): Promise<{
+    txId: string;
+    rewardSompi: bigint;
+    feeSompi: bigint;
+    requestHashHex: string;
+    cursorHash: string;
+  }> {
     if (!this.wallet || !this._accountId) throw new Error("Wallet is locked.");
     if (this.conn !== "connected" || !this.synced) {
       throw new Error("Connect to a synced node first.");
@@ -1392,6 +1405,20 @@ class WalletService {
         req.priorityFeeSompi && req.priorityFeeSompi > MIN_AI_REQUEST_PRIORITY_FEE
           ? req.priorityFeeSompi
           : MIN_AI_REQUEST_PRIORITY_FEE;
+
+      // request_hash = blake2b(payload)[0..32] — links the on-chain AiResponse
+      // back to this request. Capture the current sink as the forward-scan cursor.
+      const requestHashHex = aiRequestHashHex(
+        encodeAiRequestPayload({
+          modelId: MODELS[req.model].modelIdHex,
+          prompt: req.prompt,
+          maxTokens: req.maxTokens,
+          inferenceReward: rewardSompi,
+          priorityFee: feeSompi,
+        }),
+      );
+      const dag = await this.wallet.rpc.getBlockDagInfo();
+      const cursorHash = (dag as { sink?: string })?.sink ?? "";
 
       const keyMap = this.deriveKeyMap(password);
       this.assertDerivationMatches(keyMap);
@@ -1448,10 +1475,57 @@ class WalletService {
         timestamp: Date.now(),
         fromAddress: this.receiveAddress ?? undefined,
       });
-      return { txId, rewardSompi, feeSompi };
+      return { txId, rewardSompi, feeSompi, requestHashHex, cursorHash };
     } finally {
       this.txInFlight = false;
     }
+  }
+
+  /**
+   * Look for the on-chain AiResponse answering `requestHashHex` (subnetwork 0x04)
+   * by scanning forward from `cursorHash` over wRPC (getBlocks). Returns the IPFS
+   * result CID + gateway URL once found, and an advanced cursor to resume from on
+   * the next poll. wRPC-only — the answer TEXT itself lives on IPFS (open the URL).
+   */
+  async pollInferenceResult(
+    requestHashHex: string,
+    cursorHash: string,
+    opts: { maxPages?: number } = {},
+  ): Promise<{ result: { cidV0: string; url: string } | null; cursorHash: string }> {
+    if (!this.wallet) throw new Error("Wallet is locked.");
+    const maxPages = opts.maxPages ?? 4;
+    const target = requestHashHex.toLowerCase();
+    let cursor = cursorHash;
+    for (let page = 0; page < maxPages; page++) {
+      let res: any;
+      try {
+        res = await this.wallet.rpc.getBlocks({
+          lowHash: cursor || undefined,
+          includeBlocks: true,
+          includeTransactions: true,
+        });
+      } catch {
+        break;
+      }
+      const blocks: any[] = res?.blocks ?? [];
+      const hashes: string[] = res?.blockHashes ?? [];
+      for (const b of blocks) {
+        for (const tx of b.transactions ?? []) {
+          if (tx.subnetworkId !== SUBNETWORK_ID_AI_RESPONSE_HEX) continue;
+          const parsed = parseAiResponse(tx.payload);
+          if (parsed && parsed.requestHashHex.toLowerCase() === target) {
+            return {
+              result: { cidV0: parsed.cidV0, url: ipfsUrl(parsed.cidV0) },
+              cursorHash: cursor,
+            };
+          }
+        }
+      }
+      const last = hashes[hashes.length - 1];
+      if (!last || last === cursor) break; // caught up to the tip
+      cursor = last;
+    }
+    return { result: null, cursorHash: cursor };
   }
 
   // model_id(hex) -> recently-seen escrow pubkeys, cached to avoid re-walking.
