@@ -3,6 +3,15 @@
 
 import * as kaspa from "../sdk/kaspa.js";
 import wasmUrl from "../sdk/kaspa_bg.wasm?url";
+import {
+  buildAiRequestTx,
+  computeInferenceReward,
+  MODELS,
+  ModelName,
+  RequestUtxo,
+  MIN_AI_REQUEST_PRIORITY_FEE,
+} from "./aiRequest";
+import { escrowForModel } from "./aiCaps";
 
 const WALLET_FILENAME = "main";
 const WALLET_TITLE = "Keryx";
@@ -1339,6 +1348,168 @@ class WalletService {
     } finally {
       this.txInFlight = false;
     }
+  }
+
+  /**
+   * Submit an AI inference request (subnetwork 0x03) via the manual path.
+   *
+   * Funds the request from the account's UTXOs and builds the AiRequest with
+   * lib/aiRequest.buildAiRequestTx: output[0] change → self, output[1] a CSV
+   * escrow (value = inference_reward) → the given active miner, and (isPrivate)
+   * output[2] the self-send private-livefeed marker. Signs with the derived
+   * keys and broadcasts over wRPC. Returns the request tx id; the answer lands
+   * later as an on-chain AiResponse (poll separately).
+   *
+   * `minerEscrowPubkeyHex` MUST be an escrow pubkey of a miner currently serving
+   * the model, or no one can claim the escrow and the request goes unanswered.
+   * The reward/fee are computed from the node-enforced minimums for the model.
+   */
+  async submitInference(
+    password: string,
+    req: {
+      model: ModelName;
+      prompt: string;
+      maxTokens: number;
+      minerEscrowPubkeyHex: string;
+      priorityFeeSompi?: bigint;
+    },
+  ): Promise<{ txId: string; rewardSompi: bigint; feeSompi: bigint }> {
+    if (!this.wallet || !this._accountId) throw new Error("Wallet is locked.");
+    if (this.conn !== "connected" || !this.synced) {
+      throw new Error("Connect to a synced node first.");
+    }
+    if (!req.prompt.trim()) throw new Error("Empty prompt.");
+    if (this.txInFlight) {
+      throw new Error("Another transaction is already in progress. Please wait.");
+    }
+    this.txInFlight = true;
+    try {
+      const rewardSompi = computeInferenceReward(
+        MODELS[req.model].baseRewardSompi,
+        req.maxTokens,
+      );
+      const feeSompi =
+        req.priorityFeeSompi && req.priorityFeeSompi > MIN_AI_REQUEST_PRIORITY_FEE
+          ? req.priorityFeeSompi
+          : MIN_AI_REQUEST_PRIORITY_FEE;
+
+      const keyMap = this.deriveKeyMap(password);
+      this.assertDerivationMatches(keyMap);
+      const signers = Array.from(keyMap.values()).map((k) => k.toString());
+
+      const entries = await this.fetchEntries();
+      if (entries.length === 0) throw new Error("No spendable UTXOs found.");
+      const used = entries.slice(0, WalletService.MAX_TX_INPUTS);
+      this.assertEntriesCovered(used, keyMap);
+
+      const changeAddress = this.receiveAddress ?? this.accountAddresses[0];
+      if (!changeAddress) throw new Error("No change address available.");
+
+      const utxos: RequestUtxo[] = used.map((e) => ({
+        transactionId: String(e.outpoint.transactionId),
+        index: Number(e.outpoint.index),
+        amountSompi: BigInt(e.amount),
+        scriptPublicKey: {
+          version: e.scriptPublicKey.version,
+          script: e.scriptPublicKey.script,
+        },
+        blockDaaScore: BigInt(e.blockDaaScore ?? 0),
+        isCoinbase: !!e.isCoinbase,
+      }));
+
+      const tx = this.stageSync("build", () =>
+        buildAiRequestTx(kaspa as never, {
+          utxos,
+          changeAddress,
+          minerEscrowPubkeyHex: req.minerEscrowPubkeyHex,
+          modelId: MODELS[req.model].modelIdHex,
+          prompt: req.prompt,
+          maxTokens: req.maxTokens,
+          inferenceReward: rewardSompi,
+          priorityFee: feeSompi,
+          currentDaaScore: this.nodeDaa ?? 0n,
+          isPrivate: true,
+        }),
+      );
+      // Keys as HEX STRINGS, not PrivateKey instances (packaged-build wasm-bindgen quirk).
+      const signed = this.stageSync("sign", () =>
+        kaspa.signTransaction(tx as never, signers as never, true),
+      );
+      const res = await this.stage("submit", () =>
+        this.wallet!.rpc.submitTransaction({ transaction: signed as never }),
+      );
+      const txId = res?.transactionId ?? "";
+      // Mark our own change so the received-log doesn't count it as a deposit.
+      this.recordLocalActivity({
+        id: txId,
+        type: "outgoing",
+        direction: "out",
+        amountSompi: feeSompi + rewardSompi,
+        timestamp: Date.now(),
+        fromAddress: this.receiveAddress ?? undefined,
+      });
+      return { txId, rewardSompi, feeSompi };
+    } finally {
+      this.txInFlight = false;
+    }
+  }
+
+  // model_id(hex) -> recently-seen escrow pubkeys, cached to avoid re-walking.
+  private capsCache = new Map<string, { pubkeys: string[]; ts: number }>();
+  private static readonly CAPS_TTL_MS = 5 * 60 * 1000;
+  private static readonly CAPS_SCAN_MAX_BLOCKS = 200;
+
+  /**
+   * Find escrow pubkeys of miners currently serving `modelIdHex`, for routing an
+   * AiRequest's reward escrow. Walks the selected chain backward from the sink
+   * over wRPC (getBlockDagInfo + getBlock) and parses each coinbase's /ai:cap: +
+   * /escrow: fields (lib/aiCaps) — NO keryx-api / HTTP. Stops early once `want`
+   * distinct pubkeys are found; cached for CAPS_TTL_MS. Returns [] if none appear
+   * within the scan window (⇒ no active provider for that model right now).
+   */
+  async fetchModelEscrowPubkeys(
+    modelIdHex: string,
+    opts: { maxBlocks?: number; want?: number } = {},
+  ): Promise<string[]> {
+    if (!this.wallet) throw new Error("Wallet is locked.");
+    if (this.conn !== "connected" || !this.synced) {
+      throw new Error("Connect to a synced node first.");
+    }
+    const key = modelIdHex.toLowerCase();
+    const cached = this.capsCache.get(key);
+    if (cached && Date.now() - cached.ts < WalletService.CAPS_TTL_MS) {
+      return cached.pubkeys;
+    }
+    const maxBlocks = opts.maxBlocks ?? WalletService.CAPS_SCAN_MAX_BLOCKS;
+    const want = opts.want ?? 5;
+
+    const dag = await this.wallet.rpc.getBlockDagInfo();
+    let hash: string | undefined = (dag as { sink?: string })?.sink;
+    const found = new Set<string>();
+    for (let i = 0; i < maxBlocks && hash && found.size < want; i++) {
+      let block: any;
+      try {
+        const res: any = await this.wallet.rpc.getBlock({
+          hash,
+          includeTransactions: true,
+        });
+        block = res?.block ?? res;
+      } catch {
+        break; // pruned past this point or transient — keep what we have
+      }
+      if (!block) break;
+      const payloadHex: string | undefined = block.transactions?.[0]?.payload;
+      if (payloadHex) {
+        const pk = escrowForModel(payloadHex, key);
+        if (pk) found.add(pk);
+      }
+      hash =
+        block.verboseData?.selectedParentHash ??
+        block.header?.parentsByLevel?.[0]?.[0];
+    }
+    const pubkeys = Array.from(found);
+    this.capsCache.set(key, { pubkeys, ts: Date.now() });
+    return pubkeys;
   }
 
   /**
