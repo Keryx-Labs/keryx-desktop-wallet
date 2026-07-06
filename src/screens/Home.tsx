@@ -4,6 +4,7 @@ import { useWalletState } from "../lib/useWallet";
 import { Send } from "./Send";
 import { Receive } from "./Receive";
 import { Consolidate } from "./Consolidate";
+import { Chat } from "./Chat";
 
 const HISTORY_POLL_MS = 15_000;
 
@@ -12,6 +13,7 @@ export function Home() {
   const [showSend, setShowSend] = useState(false);
   const [showReceive, setShowReceive] = useState(false);
   const [showConsolidate, setShowConsolidate] = useState(false);
+  const [showChat, setShowChat] = useState(false);
   const [diag, setDiag] = useState<string | null>(null);
   const [diagBusy, setDiagBusy] = useState(false);
 
@@ -161,6 +163,14 @@ export function Home() {
             Receive
           </button>
         </div>
+        <button
+          className="btn-ghost mt-3 w-full"
+          onClick={() => setShowChat(true)}
+          disabled={!canTransact}
+          title={canTransact ? undefined : "Connect to a node first"}
+        >
+          Ask the network · AI inference
+        </button>
         {!canTransact && (
           <p className="mt-3 text-xs text-amber-300/80">
             Not connected — sending is disabled.
@@ -212,6 +222,7 @@ export function Home() {
       {showConsolidate && (
         <Consolidate onClose={() => setShowConsolidate(false)} />
       )}
+      {showChat && <Chat onClose={() => setShowChat(false)} />}
     </div>
   );
 }
