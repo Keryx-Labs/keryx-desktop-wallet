@@ -7,6 +7,7 @@ import {
   computeInferenceReward,
   MIN_AI_REQUEST_PRIORITY_FEE,
 } from "../lib/aiRequest";
+import { fetchAnswerText } from "../lib/aiResponse";
 
 const TOKEN_PRESETS = [128, 256, 512] as const;
 const DEFAULT_MODEL: ModelName = "qwen3-1.7b";
@@ -30,6 +31,9 @@ type ChatMessage =
       reqHash?: string;
       cursor?: string;
       cidUrl?: string;
+      cidV0?: string;
+      answerText?: string;
+      answerError?: boolean;
       attempts?: number;
     };
 
@@ -70,13 +74,40 @@ export function Chat({ onClose }: { onClose: () => void }) {
             m.reqHash,
             m.cursor ?? "",
           );
-          setMessages((cur) =>
-            cur.map((x, j) => {
-              if (j !== i || x.role !== "assistant") return x;
-              if (result) return { ...x, status: "answered", cidUrl: result.url };
-              return { ...x, cursor: cursorHash, attempts: (x.attempts ?? 0) + 1 };
-            }),
-          );
+          if (result) {
+            const rh = m.reqHash;
+            setMessages((cur) =>
+              cur.map((x) =>
+                x.role === "assistant" && x.reqHash === rh
+                  ? { ...x, status: "answered", cidUrl: result.url, cidV0: result.cidV0 }
+                  : x,
+              ),
+            );
+            // Fetch + render the answer inline (escaped text) from our IPFS gateway.
+            fetchAnswerText(result.cidV0)
+              .then((text) =>
+                setMessages((cur) =>
+                  cur.map((x) =>
+                    x.role === "assistant" && x.reqHash === rh ? { ...x, answerText: text } : x,
+                  ),
+                ),
+              )
+              .catch(() =>
+                setMessages((cur) =>
+                  cur.map((x) =>
+                    x.role === "assistant" && x.reqHash === rh ? { ...x, answerError: true } : x,
+                  ),
+                ),
+              );
+          } else {
+            setMessages((cur) =>
+              cur.map((x, j) =>
+                j === i && x.role === "assistant"
+                  ? { ...x, cursor: cursorHash, attempts: (x.attempts ?? 0) + 1 }
+                  : x,
+              ),
+            );
+          }
         } catch {
           /* transient RPC error — retry next tick */
         }
@@ -326,20 +357,27 @@ function Bubble({ msg }: { msg: ChatMessage }) {
         )}
         {msg.status === "answered" && (
           <div className="text-sm text-emerald-100/90">
-            <p>Answer ready ✓</p>
+            {msg.answerText !== undefined ? (
+              <p className="whitespace-pre-wrap">{msg.answerText}</p>
+            ) : msg.answerError ? (
+              <p className="text-amber-300/80">
+                Answer ready ✓ — couldn't load it inline, open it on IPFS below.
+              </p>
+            ) : (
+              <p className="animate-pulse text-emerald-200/60">
+                Answer ready ✓ — loading…
+              </p>
+            )}
             {msg.cidUrl && (
               <a
                 href={msg.cidUrl}
                 target="_blank"
                 rel="noreferrer"
-                className="mt-1 inline-block text-keryx-green underline hover:text-emerald-300"
+                className="mt-1 inline-block text-[11px] text-keryx-green/80 underline hover:text-emerald-300"
               >
-                Open answer ↗
+                View on IPFS ↗
               </a>
             )}
-            <p className="mt-1 text-[10px] text-emerald-200/30">
-              (opens the result on IPFS in your browser)
-            </p>
           </div>
         )}
         {msg.status === "error" && (

@@ -74,3 +74,21 @@ export function parseAiResponse(
 export function ipfsUrl(cidV0: string): string {
   return `https://keryx-labs.com/ipfs/${cidV0}`;
 }
+
+/**
+ * Fetch the answer text from our IPFS gateway and decode it as UTF-8, for inline
+ * display. Capped to avoid rendering an oversized blob. The gateway host must be
+ * allowed by the app CSP `connect-src` (keryx-labs.com). No cryptographic check:
+ * the CIDv0 is a dag-pb multihash of the UnixFS block, not of the raw bytes, so a
+ * byte-level hash would not match — trust here is TLS to our own gateway.
+ */
+export async function fetchAnswerText(
+  cidV0: string,
+  maxBytes = 256 * 1024,
+): Promise<string> {
+  const resp = await fetch(ipfsUrl(cidV0));
+  if (!resp.ok) throw new Error(`IPFS gateway ${resp.status}`);
+  const buf = new Uint8Array(await resp.arrayBuffer());
+  const slice = buf.length > maxBytes ? buf.subarray(0, maxBytes) : buf;
+  return new TextDecoder("utf-8").decode(slice);
+}
