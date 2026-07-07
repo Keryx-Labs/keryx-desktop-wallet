@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { wallet } from "./lib/wallet";
 import { useWalletState } from "./lib/useWallet";
-import { loadNodeSettings, saveNodeSettings } from "./lib/settings";
+import {
+  loadAutoLockMinutes,
+  loadNodeSettings,
+  saveAutoLockMinutes,
+  saveNodeSettings,
+} from "./lib/settings";
 import { Onboarding } from "./screens/Onboarding";
 import { Unlock } from "./screens/Unlock";
 import { Home } from "./screens/Home";
@@ -10,13 +15,12 @@ import { NodeSettingsModal } from "./components/NodeSettingsModal";
 
 type Phase = "loading" | "onboarding" | "unlock" | "home" | "error";
 
-const AUTO_LOCK_MS = 5 * 60 * 1000; // 5 minutes
-
 export default function App() {
   const w = useWalletState();
   const [phase, setPhase] = useState<Phase>("loading");
   const [bootError, setBootError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [autoLockMinutes, setAutoLockMinutes] = useState(loadAutoLockMinutes);
 
   // --- boot: load wasm + node settings, decide onboarding vs unlock ---
   useEffect(() => {
@@ -42,11 +46,12 @@ export default function App() {
   const timer = useRef<number | null>(null);
   useEffect(() => {
     if (phase !== "home") return;
+    if (autoLockMinutes <= 0) return;
     const reset = () => {
       if (timer.current) window.clearTimeout(timer.current);
       timer.current = window.setTimeout(() => {
         void lock();
-      }, AUTO_LOCK_MS);
+      }, autoLockMinutes * 60 * 1000);
     };
     const events = ["mousemove", "keydown", "click", "touchstart"];
     events.forEach((e) => window.addEventListener(e, reset));
@@ -55,14 +60,22 @@ export default function App() {
       events.forEach((e) => window.removeEventListener(e, reset));
       if (timer.current) window.clearTimeout(timer.current);
     };
-  }, [phase, lock]);
+  }, [phase, lock, autoLockMinutes]);
 
-  async function saveNode(s: { url: string; networkId: string }) {
+  async function saveSettings(s: { url: string; networkId: string }, nextAutoLockMinutes: number) {
+    const prev = loadNodeSettings();
+    const nodeChanged = s.url !== prev.url || s.networkId !== prev.networkId;
     saveNodeSettings(s);
-    const wasOpen = phase === "home";
-    await wallet.setNode(s); // locks + resets if a wallet is open (network mismatch guard)
+    saveAutoLockMinutes(nextAutoLockMinutes);
+    setAutoLockMinutes(nextAutoLockMinutes);
     setShowSettings(false);
-    if (wasOpen) setPhase("unlock"); // changed node/network → re-unlock on the new network
+    // Only reconnect (which locks the wallet) when the node actually changed — saving just the
+    // auto-lock timeout must not log the user out.
+    if (nodeChanged) {
+      const wasOpen = phase === "home";
+      await wallet.setNode(s); // locks + resets if a wallet is open (network mismatch guard)
+      if (wasOpen) setPhase("unlock"); // changed node/network → re-unlock on the new network
+    }
   }
 
   if (phase === "loading") {
@@ -94,7 +107,8 @@ export default function App() {
         {showSettings && (
           <NodeSettingsModal
             initial={loadNodeSettings()}
-            onSave={saveNode}
+            initialAutoLockMinutes={autoLockMinutes}
+            onSave={saveSettings}
             onClose={() => setShowSettings(false)}
           />
         )}
@@ -110,7 +124,8 @@ export default function App() {
         {showSettings && (
           <NodeSettingsModal
             initial={loadNodeSettings()}
-            onSave={saveNode}
+            initialAutoLockMinutes={autoLockMinutes}
+            onSave={saveSettings}
             onClose={() => setShowSettings(false)}
           />
         )}
@@ -131,7 +146,8 @@ export default function App() {
       {showSettings && (
         <NodeSettingsModal
           initial={loadNodeSettings()}
-          onSave={saveNode}
+          initialAutoLockMinutes={autoLockMinutes}
+          onSave={saveSettings}
           onClose={() => setShowSettings(false)}
         />
       )}
@@ -153,7 +169,7 @@ function SettingsButtonFloating({ onClick }: { onClick: () => void }) {
       onClick={onClick}
       className="btn-ghost fixed bottom-4 right-4 px-3 py-1.5 text-xs"
     >
-      Node settings
+      Settings
     </button>
   );
 }
