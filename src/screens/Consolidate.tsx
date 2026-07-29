@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { wallet, formatKrx, formatKrxShort } from "../lib/wallet";
 import { useWalletState } from "../lib/useWallet";
 
@@ -28,7 +28,6 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
   const [costBusy, setCostBusy] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
   const [diag, setDiag] = useState<string | null>(null);
-  const pollRef = useRef<number | null>(null);
 
   const busy = run?.running === true;
 
@@ -51,25 +50,12 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
     }
   }, []);
 
-  // Initial snapshot + cost estimate. Poll while a run is active so the count drops live; the
-  // interval is cleared on unmount but the RUN itself keeps going (it lives on the service).
+  // Snapshot when the modal opens IDLE, and once more when a run finishes. NEVER poll the full
+  // UTXO set while a run is active: on a 250k-UTXO wallet those responses are exactly what
+  // saturated the RPC connection and timed out the submits — during a run the live count comes
+  // from the run itself (run.remaining, fed by its own confirmation polls at zero extra cost).
   useEffect(() => {
-    void loadStats();
-    return () => {
-      if (pollRef.current !== null) window.clearInterval(pollRef.current);
-    };
-  }, [loadStats]);
-
-  useEffect(() => {
-    if (!busy) return;
-    if (pollRef.current !== null) window.clearInterval(pollRef.current);
-    pollRef.current = window.setInterval(() => void loadStats(), 5000) as unknown as number;
-    return () => {
-      if (pollRef.current !== null) {
-        window.clearInterval(pollRef.current);
-        pollRef.current = null;
-      }
-    };
+    if (!busy) void loadStats(); // opened idle, or a run just finished
   }, [busy, loadStats]);
 
   const loadCost = useCallback(async () => {
@@ -91,7 +77,9 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
       return;
     }
     try {
-      await wallet.consolidate(password);
+      // The accepted estimate is a hard ceiling: the run trims its last round to the remaining
+      // fee budget and stops when it is exhausted, so it can never spend more than confirmed.
+      await wallet.consolidate(password, undefined, cost?.feeSompi);
       setPassword("");
       void loadStats();
     } catch (e) {
@@ -103,7 +91,9 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
     }
   }
 
-  const count = stats?.count ?? 0;
+  // While running, the count comes from the run (kept live by its confirmation polls); the full
+  // stats read only happens while idle.
+  const count = busy && run ? run.remaining : (stats?.count ?? 0);
   const startCount = run?.startCount ?? null;
   const progress =
     startCount != null && startCount > 1

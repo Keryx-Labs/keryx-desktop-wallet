@@ -1089,10 +1089,12 @@ class WalletService {
    */
   async consolidate(
     password: string,
-    onProgress?: (info: ConsolidateProgress) => void
+    onProgress?: (info: ConsolidateProgress) => void,
+    maxFeeSompi?: bigint
   ): Promise<string[]> {
     // Same reason as send(): bypass the empty UtxoContext and sweep via the manual path.
-    return this.consolidateManual(password, onProgress);
+    // maxFeeSompi = the fee the user accepted in the UI; the run never exceeds it.
+    return this.consolidateManual(password, onProgress, maxFeeSompi);
   }
 
   // =====================================================================
@@ -1150,19 +1152,30 @@ class WalletService {
   private coinbaseMaturity = WalletService.COINBASE_MATURITY;
   private userTxMaturity = WalletService.USER_TX_MATURITY;
 
+  /** Ceiling for coinbase-floor escalation (the base 1000 came from the node's own message). */
+  private static readonly MAX_ADAPTIVE_COINBASE_MATURITY = 16384n;
+
   /**
-   * Raise the maturity floors after the node rejected a tx for an immaturity/sequence-lock reason.
-   * Doubling converges in a few steps and is bounded; returns false when already at the ceiling so
-   * the caller reports the real error instead of looping.
+   * Raise a maturity floor after the node rejected a tx for an immaturity/sequence-lock reason.
+   * Escalates the knob the node actually complained about: doubling the user-tx floor on a
+   * coinbase rejection would add pointless between-round waits without fixing anything. Doubling
+   * converges in a few steps and is bounded; returns false when already at the ceiling so the
+   * caller reports the real error instead of looping.
    */
-  private escalateMaturity(): boolean {
+  private escalateMaturity(rejectionMsg: string): boolean {
+    if (/coinbase/i.test(rejectionMsg)) {
+      if (this.coinbaseMaturity >= WalletService.MAX_ADAPTIVE_COINBASE_MATURITY) return false;
+      this.coinbaseMaturity = this.coinbaseMaturity * 2n;
+      if (this.coinbaseMaturity > WalletService.MAX_ADAPTIVE_COINBASE_MATURITY) {
+        this.coinbaseMaturity = WalletService.MAX_ADAPTIVE_COINBASE_MATURITY;
+      }
+      return true;
+    }
     if (this.userTxMaturity >= WalletService.MAX_ADAPTIVE_MATURITY) return false;
     this.userTxMaturity = this.userTxMaturity * 2n;
     if (this.userTxMaturity > WalletService.MAX_ADAPTIVE_MATURITY) {
       this.userTxMaturity = WalletService.MAX_ADAPTIVE_MATURITY;
     }
-    // Coinbase maturity is known from the node's own message, so nudge it far less aggressively.
-    this.coinbaseMaturity = this.coinbaseMaturity + WalletService.USER_TX_MATURITY;
     return true;
   }
 
@@ -1334,11 +1347,15 @@ class WalletService {
   }
 
   /**
-   * @param requireDaa when true (money paths) an unknown virtual DAA is a hard error instead of
-   *        silently disabling the maturity filter. A consolidation that skipped the filter would
-   *        spend its own fresh output and be rejected — better to say so than to burn a fee.
+   * @param forConsolidation consolidation mode: an unknown virtual DAA becomes a hard error
+   *        instead of silently disabling the maturity filter (a consolidation that skipped it
+   *        would spend its own fresh output and be rejected — better to say so than to burn a
+   *        fee), AND the user-tx age floor is applied on top of the coinbase one. Sends and
+   *        estimates keep coinbase-only filtering: the user-tx floor exists to stop a
+   *        consolidation round from spending its OWN seconds-old compound output, and applying
+   *        a session-escalated floor to sends would silently hide freshly received funds.
    */
-  private async fetchEntries(requireDaa = false): Promise<any[]> {
+  private async fetchEntries(forConsolidation = false): Promise<any[]> {
     if (!this.wallet) throw new Error("Wallet is locked.");
     const scan = this.activeAddresses();
     if (scan.length === 0) {
@@ -1381,7 +1398,7 @@ class WalletService {
         /* handled below */
       }
     }
-    if (daa == null && requireDaa) {
+    if (daa == null && forConsolidation) {
       throw new Error(
         "Could not read the node's DAA score, so UTXO maturity cannot be checked. " +
           "Wait for the node to respond and try again."
@@ -1391,7 +1408,8 @@ class WalletService {
       daa != null
         ? mapped.filter((e) => {
             const age = daa - e.blockDaaScore;
-            return age >= (e.isCoinbase ? this.coinbaseMaturity : this.userTxMaturity);
+            if (e.isCoinbase) return age >= this.coinbaseMaturity;
+            return !forConsolidation || age >= this.userTxMaturity;
           })
         : mapped;
     // Spend the LARGEST UTXOs first. A send/estimate is capped at MAX_TX_INPUTS inputs per tx, so
@@ -1620,7 +1638,8 @@ class WalletService {
    */
   async consolidateManual(
     password: string,
-    onProgress?: (info: ConsolidateProgress) => void
+    onProgress?: (info: ConsolidateProgress) => void,
+    maxFeeSompi?: bigint
   ): Promise<string[]> {
     if (!this.wallet || !this._accountId) throw new Error("Wallet is locked.");
     if (this.conn !== "connected" || !this.synced) {
@@ -1632,8 +1651,17 @@ class WalletService {
       throw new Error("Another transaction is already in progress. Please wait.");
     }
     this.txInFlight = true;
-    const keyMap = this.deriveKeyMap(password);
-    this.assertDerivationMatches(keyMap);
+    let keyMap: Map<string, kaspa.PrivateKey>;
+    try {
+      // deriveKeyMap throws on a wrong password. That path MUST release the money-op lock too —
+      // otherwise one typo here leaves txInFlight stuck and every later send/consolidate fails
+      // with "another transaction is in progress" until the app restarts.
+      keyMap = this.deriveKeyMap(password);
+      this.assertDerivationMatches(keyMap);
+    } catch (e) {
+      this.txInFlight = false;
+      throw e;
+    }
     const keys = Array.from(keyMap.values());
     const changeAddress = this.receiveAddress ?? this.accountAddresses[0];
     if (!changeAddress) {
@@ -1662,6 +1690,20 @@ class WalletService {
 
     try {
       for (let round = 1; round <= WalletService.MAX_CONSOLIDATE_ROUNDS; round++) {
+        if (run.stopRequested) {
+          run.phase = "stopped";
+          break;
+        }
+        // The run sweeps into the account that was active when it STARTED. If the user switched
+        // accounts mid-run (the run survives closing the modal), continuing would sweep the new
+        // account's UTXOs into the old account's address — stop instead. selectReceiveAddress is
+        // also guarded, so this is a belt-and-braces check.
+        if (this.receiveAddress !== changeAddress) {
+          throw new Error(
+            "The active account changed while consolidating, so the run was stopped for safety. " +
+              "Transactions already submitted are unaffected."
+          );
+        }
         run.round = round;
         run.phase = "building";
         this.emit();
@@ -1695,6 +1737,24 @@ class WalletService {
               `Consolidate in stages instead.`
           );
         }
+        // Never exceed the fee the user explicitly accepted. New UTXOs can arrive mid-run (mining
+        // payouts) and previously-immature ones mature, so the up-front estimate is not a ceiling
+        // by itself — trim the round to the remaining budget and stop when it is exhausted.
+        if (maxFeeSompi != null) {
+          const budgetTxs = Number(
+            (maxFeeSompi - run.feePaidSompi) / WalletService.KERYX_MIN_FEE
+          );
+          if (chunks.length > budgetTxs) {
+            chunks.length = Math.max(0, budgetTxs);
+            if (chunks.length === 0) {
+              run.lastError =
+                "Reached the fee amount you accepted — stopping here. " +
+                "Run Consolidate again to continue.";
+              run.phase = "stopped";
+              break;
+            }
+          }
+        }
 
         // Every input must be signable before we build anything.
         for (const chunk of chunks) this.assertEntriesCovered(chunk, keyMap);
@@ -1707,7 +1767,12 @@ class WalletService {
         // A whole round failing on maturity means our floor is too low for this network — raise it
         // and retry the same round rather than reporting a confusing rejection.
         if (result.txids.length === 0) {
-          if (result.maturityRejected && this.escalateMaturity()) {
+          if (run.stopRequested) {
+            // Stop pressed before any chunk went out: that's a stop, not a failure.
+            run.phase = "stopped";
+            break;
+          }
+          if (result.maturityMsg !== null && this.escalateMaturity(result.maturityMsg)) {
             run.lastError = `Node requires older inputs — waiting longer (retrying round ${round}).`;
             this.emit();
             round--; // retry this round with the raised floor
@@ -1739,7 +1804,11 @@ class WalletService {
         if (remaining < 2) break;
       }
 
-      run.phase = run.stopRequested ? "stopped" : "done";
+      // Preserve a terminal state a break already set (fee budget exhausted → "stopped"); only a
+      // run that actually swept everything it could is "done".
+      if (run.phase !== "stopped") {
+        run.phase = run.stopRequested ? "stopped" : "done";
+      }
       return txids;
     } catch (e) {
       run.phase = "failed";
@@ -1785,12 +1854,14 @@ class WalletService {
   ): Promise<{
     txids: string[];
     spent: Set<string>;
-    maturityRejected: boolean;
+    /** First rejection that looked like an immaturity/sequence-lock complaint, verbatim — the
+     *  escalation needs the wording to raise the right floor (coinbase vs user-tx). */
+    maturityMsg: string | null;
     firstError: string | null;
   }> {
     const txids: string[] = [];
     const spent = new Set<string>();
-    let maturityRejected = false;
+    let maturityMsg: string | null = null;
     let firstError: string | null = null;
     let next = 0;
 
@@ -1824,7 +1895,7 @@ class WalletService {
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           run.txsFailed++;
-          if (WalletService.isMaturityRejection(msg)) maturityRejected = true;
+          if (maturityMsg === null && WalletService.isMaturityRejection(msg)) maturityMsg = msg;
           if (firstError === null) firstError = msg;
           run.lastError = msg;
         }
@@ -1834,7 +1905,7 @@ class WalletService {
 
     const lanes = Math.min(WalletService.SUBMIT_CONCURRENCY, chunks.length);
     await Promise.all(Array.from({ length: lanes }, () => worker()));
-    return { txids, spent, maturityRejected, firstError };
+    return { txids, spent, maturityMsg, firstError };
   }
 
   /**
@@ -1850,6 +1921,15 @@ class WalletService {
     let pollMs = 2500;
     let keys = await this.fetchOutpointKeys();
     for (;;) {
+      // Live count for the UI on every poll — this read already paid for the data, and it keeps
+      // the progress bar moving without any extra full-set fetch from the modal.
+      if (this.consolidateRun) {
+        this.consolidateRun.remaining = keys.size;
+        this.emit();
+      }
+      // Honor Stop during the wait too: this phase can last minutes, and ignoring the button here
+      // used to end the run with a bogus "failed" state one round later.
+      if (this.consolidateRun?.stopRequested) return keys.size;
       let stillThere = false;
       for (const k of spent) {
         if (keys.has(k)) {
@@ -1871,22 +1951,32 @@ class WalletService {
     // Inputs are consumed, so the new outputs exist. Let them age past the user-tx maturity floor
     // before the next round spends them. DAA advances ~1/s, so this is seconds, once per round.
     await this.waitForMaturity();
-    return (await this.fetchOutpointKeys()).size;
+    // The last poll's snapshot already reflects this round (inputs gone, compounds present) — reuse
+    // its count instead of paying for one more full fetch per round on a huge wallet.
+    return keys.size;
   }
 
-  /** Pause until the DAA score has advanced past the user-tx maturity floor (plus a small margin). */
+  /** Pause until the DAA score has advanced past the user-tx maturity floor (plus a small margin).
+   *  Aborts promptly on Stop or lock — an escalated floor can make this wait minutes, and holding
+   *  the run (and its derived keys) alive after a lock would violate what "locked" means. */
   private async waitForMaturity(): Promise<void> {
     const startDaa = this.nodeDaa;
     if (startDaa == null) {
-      await this.sleep(Number(this.userTxMaturity) * 1000);
+      // No DAA reference at all: wall-clock fallback (~1 DAA/s), bounded and stoppable.
+      const end = Date.now() + Math.min(Number(this.userTxMaturity) * 1000, 180000);
+      while (Date.now() < end) {
+        if (!this.wallet || this.consolidateRun?.stopRequested) return;
+        await this.sleep(2000);
+      }
       return;
     }
     const target = startDaa + this.userTxMaturity + 2n;
     const deadline = Date.now() + 180000;
     for (;;) {
+      if (!this.wallet || this.consolidateRun?.stopRequested) return;
       let daa = this.nodeDaa;
       try {
-        const info = await this.wallet!.rpc.getServerInfo();
+        const info = await this.wallet.rpc.getServerInfo();
         daa = info.virtualDaaScore;
         this.nodeDaa = daa;
       } catch {
@@ -2014,6 +2104,12 @@ class WalletService {
     if (!this.wallet || !this._accountId) {
       throw new Error("Wallet is locked.");
     }
+    // Same reason as selectReceiveAddress: this switches the active address.
+    if (this.txInFlight) {
+      throw new Error(
+        "A transaction or consolidation is in progress — stop it before switching accounts."
+      );
+    }
     if (this.receiveAddresses.length >= WalletService.MAX_RECEIVE_ADDRESSES) {
       throw new Error(
         `This wallet keeps up to ${WalletService.MAX_RECEIVE_ADDRESSES} addresses. Pick one from the list instead.`
@@ -2058,6 +2154,14 @@ class WalletService {
 
   /** Make `addr` (one of the switcher addresses) the active receive address. Persisted. */
   selectReceiveAddress(addr: string): void {
+    // Money ops capture the active address when they start and scan the ACTIVE address each round.
+    // Switching mid-run would make a background consolidation sweep the newly selected account's
+    // UTXOs into the old account's address — refuse until it finishes or is stopped.
+    if (this.txInFlight) {
+      throw new Error(
+        "A transaction or consolidation is in progress — stop it before switching accounts."
+      );
+    }
     if (!this.receiveAddresses.includes(addr)) {
       throw new Error("That address is not one of your wallet's addresses.");
     }
