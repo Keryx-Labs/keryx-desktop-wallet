@@ -47,6 +47,10 @@ export default function App() {
   useEffect(() => {
     if (phase !== "home") return;
     if (autoLockMinutes <= 0) return;
+    // A consolidation of a large wallet runs for several minutes with no mouse or keyboard activity.
+    // Auto-locking through it would kill the run mid-flight, so hold off while one is in progress —
+    // the timer re-arms as soon as it finishes.
+    if (w.isConsolidating) return;
     const reset = () => {
       if (timer.current) window.clearTimeout(timer.current);
       timer.current = window.setTimeout(() => {
@@ -60,7 +64,7 @@ export default function App() {
       events.forEach((e) => window.removeEventListener(e, reset));
       if (timer.current) window.clearTimeout(timer.current);
     };
-  }, [phase, lock, autoLockMinutes]);
+  }, [phase, lock, autoLockMinutes, w.isConsolidating]);
 
   async function saveSettings(s: { url: string; networkId: string }, nextAutoLockMinutes: number) {
     const prev = loadNodeSettings();
@@ -142,6 +146,7 @@ export default function App() {
         onSettings={() => setShowSettings(true)}
         onLock={lock}
       />
+      <ConsolidateStrip />
       <Home />
       {showSettings && (
         <NodeSettingsModal
@@ -151,6 +156,28 @@ export default function App() {
           onClose={() => setShowSettings(false)}
         />
       )}
+    </div>
+  );
+}
+
+/**
+ * Persistent strip shown while a consolidation runs, so a background run is never invisible — the
+ * whole point of moving the run onto the service. Reads the same observable state the modal does.
+ */
+function ConsolidateStrip() {
+  const w = useWalletState();
+  const run = w.consolidateRun;
+  if (!run?.running) return null;
+  return (
+    <div className="mx-auto mt-4 flex max-w-2xl items-center justify-between gap-3 rounded-xl border border-keryx-green/40 bg-keryx-green/10 px-4 py-2 text-xs">
+      <span className="flex items-center gap-2 text-keryx-green">
+        <span className="h-2 w-2 animate-pulse rounded-full bg-keryx-green" />
+        Consolidating · round {run.round}/{run.round + run.roundsEstimate - 1} ·{" "}
+        {run.txsSubmitted} tx{run.txsSubmitted === 1 ? "" : "s"}
+      </span>
+      <span className="font-mono text-emerald-200/60">
+        {run.startCount} → {run.remaining} UTXOs
+      </span>
     </div>
   );
 }

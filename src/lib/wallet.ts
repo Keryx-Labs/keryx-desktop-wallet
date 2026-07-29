@@ -91,6 +91,33 @@ export interface ConsolidateProgress {
   remaining: number;
 }
 
+/**
+ * Live state of a consolidation run. Lives on the service, not in the modal, so the run survives
+ * closing the window and reopening shows the truth instead of a blank form.
+ */
+export interface ConsolidateRun {
+  running: boolean;
+  /** 1-based current round. Each round divides the UTXO count by ~MAX_TX_INPUTS. */
+  round: number;
+  /** Rounds still expected, derived from the current count (log_80(N), so usually 1–3). */
+  roundsEstimate: number;
+  /** UTXOs when the run started, and right now. */
+  startCount: number;
+  remaining: number;
+  txsSubmitted: number;
+  txsFailed: number;
+  /** Submitted transaction ids, so reopening the window after the run still shows the result. */
+  txids: string[];
+  /** Fees actually committed so far (submitted txs × the per-tx minimum fee). */
+  feePaidSompi: bigint;
+  startedAt: number;
+  /** Set when the run stopped early; also shown while running as a non-fatal warning. */
+  lastError: string | null;
+  stopRequested: boolean;
+  /** What the run is doing right now, for the progress line. */
+  phase: "building" | "submitting" | "waiting" | "done" | "stopped" | "failed";
+}
+
 /** Stable identity for a UTXO (transactionId:index), used to tell when a batch's inputs are gone. */
 function outpointKey(e: { outpoint?: { transactionId?: string; index?: number } }): string {
   const op = e.outpoint ?? {};
@@ -120,6 +147,9 @@ class WalletService {
   /** Public-key generator cached at open() (no private keys) so "My addresses" can derive + scan the
    *  wallet's addresses WITHOUT asking for the password again. Dropped on lock. */
   private pubGen: kaspa.PublicKeyGenerator | null = null;
+  /** Live consolidation state, or null if none has run this session. Kept here rather than in the
+   *  modal so the run survives closing it and reopening shows the real state. */
+  consolidateRun: ConsolidateRun | null = null;
   balance: WalletBalance = { mature: 0n, pending: 0n };
   lastError: string | null = null;
 
@@ -764,6 +794,15 @@ class WalletService {
   /** Lock: stop activity and forget the in-memory account. Storage is untouched. */
   async lock(): Promise<void> {
     const w = this.wallet;
+    // A running consolidation would keep submitting into a connection we are about to drop. Ask it
+    // to stop and let it finish the transaction in flight — locking mid-submit achieves nothing
+    // except an unclear failure.
+    if (this.isConsolidating) {
+      this.stopConsolidate();
+      for (let i = 0; i < 60 && this.isConsolidating; i++) {
+        await this.sleep(250);
+      }
+    }
     this.stopStatusPoll();
     if (this.scanTimer !== null) {
       clearTimeout(this.scanTimer);
@@ -1091,10 +1130,59 @@ class WalletService {
   // value is Keryx's coinbase maturity, taken from the node's own rejection message; ideally
   // read from INetworkParams later.
   private static readonly COINBASE_MATURITY = 1000n;
-  /** Backstop for the consolidate auto-loop. Each batch nets at least −1 UTXO, so a real run needs
-   *  ≈ceil((N−1)/(MAX_TX_INPUTS−1)) batches (e.g. ~8 for 600 UTXOs); this cap only trips if the set
-   *  inexplicably fails to shrink. */
-  private static readonly MAX_CONSOLIDATE_BATCHES = 200;
+  /**
+   * Minimum DAA age for a NON-coinbase UTXO before we will spend it.
+   *
+   * Why this exists: consolidation creates a compound output and the very next batch used to spend
+   * it seconds later, which the node rejects with "one of the transaction sequence locks conditions
+   * was not met" — Kaspa applies a maturity window to ordinary transaction outputs too, not just to
+   * coinbase (the SDK exposes the same notion via UtxoProcessor.setUserTransactionMaturityDAA,
+   * kaspa.d.ts:7451). Filtering only coinbase let our own freshest output straight back in as an
+   * input, and the largest-first ordering guaranteed it was input #1.
+   */
+  private static readonly USER_TX_MATURITY = 16n;
+  /** Ceiling for the adaptive escalation below — refuse to wait absurdly long on a bad guess. */
+  private static readonly MAX_ADAPTIVE_MATURITY = 4096n;
+
+  // Effective maturity floors for THIS session. Not static: the node's real values are not readable
+  // through the SDK (it only exposes setters), so on a maturity/sequence-lock rejection we raise
+  // these and retry instead of failing on a hardcoded guess.
+  private coinbaseMaturity = WalletService.COINBASE_MATURITY;
+  private userTxMaturity = WalletService.USER_TX_MATURITY;
+
+  /**
+   * Raise the maturity floors after the node rejected a tx for an immaturity/sequence-lock reason.
+   * Doubling converges in a few steps and is bounded; returns false when already at the ceiling so
+   * the caller reports the real error instead of looping.
+   */
+  private escalateMaturity(): boolean {
+    if (this.userTxMaturity >= WalletService.MAX_ADAPTIVE_MATURITY) return false;
+    this.userTxMaturity = this.userTxMaturity * 2n;
+    if (this.userTxMaturity > WalletService.MAX_ADAPTIVE_MATURITY) {
+      this.userTxMaturity = WalletService.MAX_ADAPTIVE_MATURITY;
+    }
+    // Coinbase maturity is known from the node's own message, so nudge it far less aggressively.
+    this.coinbaseMaturity = this.coinbaseMaturity + WalletService.USER_TX_MATURITY;
+    return true;
+  }
+
+  /** True when a node rejection is about an input not being spendable YET (vs a real failure). */
+  private static isMaturityRejection(msg: string): boolean {
+    return /sequence lock|immature|maturity|not.{0,12}mature/i.test(msg);
+  }
+
+  /** Backstop for the consolidate round loop. Each round divides the set by ~MAX_TX_INPUTS, so even
+   *  250k UTXOs finish in 3 rounds; this only trips if the set inexplicably fails to shrink. */
+  private static readonly MAX_CONSOLIDATE_ROUNDS = 12;
+  /** Safety cap on transactions per run, so a pathological set can't fire off unbounded txs (each
+   *  one costs KERYX_MIN_FEE). 250k UTXOs needs ~3.1k txs, so this leaves real headroom. */
+  private static readonly MAX_CONSOLIDATE_TXS = 6000;
+  /** Concurrent submits in flight. Enough to keep the node busy without burying its RPC queue. */
+  private static readonly SUBMIT_CONCURRENCY = 8;
+  /** A getUtxosByAddresses over a huge set is slow but must not hang forever. */
+  private static readonly UTXO_FETCH_TIMEOUT_MS = 90000;
+  /** Submit timeout. The old 20s default was too tight under the load of a large consolidation. */
+  private static readonly SUBMIT_TIMEOUT_MS = 60000;
   /** Keryx's minimum relay fee (sompi). The node rejects txs paying less than this regardless of
    *  size (≈0.3 KRX, anti-spam) — far above Kaspa's mass-based minimum. */
   private static readonly KERYX_MIN_FEE = 30000000n;
@@ -1245,13 +1333,24 @@ class WalletService {
     return a ? [a] : [];
   }
 
-  private async fetchEntries(): Promise<any[]> {
+  /**
+   * @param requireDaa when true (money paths) an unknown virtual DAA is a hard error instead of
+   *        silently disabling the maturity filter. A consolidation that skipped the filter would
+   *        spend its own fresh output and be rejected — better to say so than to burn a fee.
+   */
+  private async fetchEntries(requireDaa = false): Promise<any[]> {
     if (!this.wallet) throw new Error("Wallet is locked.");
     const scan = this.activeAddresses();
     if (scan.length === 0) {
       throw new Error("No active address to scan for UTXOs.");
     }
-    const res = await this.wallet.rpc.getUtxosByAddresses(scan);
+    // Time-boxed: a wallet with hundreds of thousands of UTXOs makes this response huge, and an
+    // unguarded call here was one of the reported "RPC request timeout" hangs.
+    const res = await this.withTimeout(
+      this.wallet.rpc.getUtxosByAddresses(scan),
+      WalletService.UTXO_FETCH_TIMEOUT_MS,
+      "utxo-fetch"
+    );
     const refs = (res?.entries ?? []) as any[];
     const mapped = refs.map((r) => {
       const op = r.outpoint ?? {};
@@ -1268,11 +1367,10 @@ class WalletService {
         isCoinbase: !!r.isCoinbase,
       };
     });
-    // Skip immature coinbase (mining-reward) UTXOs: the node rejects a tx that spends one before
-    // COINBASE_MATURITY DAA have passed, so only a miner with freshly-mined rewards hits this. Use
-    // the live virtual DAA; refresh it once if we don't have it yet. If it stays unknown we don't
-    // filter (the node would reject anyway — never worse). Excluding a borderline reward just
-    // defers it to a later batch; it can't move wrong/double funds.
+    // Skip UTXOs the node will not let us spend YET. Coinbase (mining reward) has a long maturity;
+    // ordinary outputs have a shorter one, but it is NOT zero — spending our own seconds-old
+    // consolidation output is exactly what produced "one of the transaction sequence locks
+    // conditions was not met". Both floors are session values that escalate on such a rejection.
     let daa = this.nodeDaa;
     if (daa == null) {
       try {
@@ -1280,20 +1378,49 @@ class WalletService {
         daa = info.virtualDaaScore;
         this.nodeDaa = daa;
       } catch {
-        /* leave daa null → skip the maturity filter this round */
+        /* handled below */
       }
+    }
+    if (daa == null && requireDaa) {
+      throw new Error(
+        "Could not read the node's DAA score, so UTXO maturity cannot be checked. " +
+          "Wait for the node to respond and try again."
+      );
     }
     const spendable =
       daa != null
-        ? mapped.filter(
-            (e) => !e.isCoinbase || daa - e.blockDaaScore >= WalletService.COINBASE_MATURITY
-          )
+        ? mapped.filter((e) => {
+            const age = daa - e.blockDaaScore;
+            return age >= (e.isCoinbase ? this.coinbaseMaturity : this.userTxMaturity);
+          })
         : mapped;
     // Spend the LARGEST UTXOs first. A send/estimate is capped at MAX_TX_INPUTS inputs per tx, so
     // taking the node's arbitrary order could slice off dust and fail to fund a send that is well
     // within the real balance. Largest-first guarantees one tx funds the maximum possible amount.
     spendable.sort((a, b) => (a.amount < b.amount ? 1 : a.amount > b.amount ? -1 : 0));
     return spendable;
+  }
+
+  /**
+   * Cheap sibling of fetchEntries for the between-rounds wait: only the outpoint keys and the count
+   * are needed there. Skips the per-entry object mapping, the BigInt conversions, the maturity
+   * filter and the sort — on a 250k-UTXO wallet that work dominated the poll loop.
+   */
+  private async fetchOutpointKeys(): Promise<Set<string>> {
+    if (!this.wallet) throw new Error("Wallet is locked.");
+    const scan = this.activeAddresses();
+    if (scan.length === 0) return new Set();
+    const res = await this.withTimeout(
+      this.wallet.rpc.getUtxosByAddresses(scan),
+      WalletService.UTXO_FETCH_TIMEOUT_MS,
+      "utxo-fetch"
+    );
+    const out = new Set<string>();
+    for (const r of (res?.entries ?? []) as any[]) {
+      const op = r.outpoint ?? {};
+      out.add(`${op.transactionId ?? op.getId?.() ?? ""}:${Number(op.index ?? 0)}`);
+    }
+    return out;
   }
 
   /**
@@ -1439,8 +1566,10 @@ class WalletService {
     const signed = this.stageSync("sign", () =>
       kaspa.signTransaction(tx, signers as any, true)
     );
-    const res = await this.stage("submit", () =>
-      this.wallet!.rpc.submitTransaction({ transaction: signed as any })
+    const res = await this.stage(
+      "submit",
+      () => this.wallet!.rpc.submitTransaction({ transaction: signed as any }),
+      WalletService.SUBMIT_TIMEOUT_MS
     );
     return res?.transactionId ?? "";
   }
@@ -1474,13 +1603,20 @@ class WalletService {
    * CONTEXT-FREE consolidate (compound). Sweeps the whole UTXO set into a single UTXO back to our
    * own change/receive address, via the synchronous build path (no async Generator → no hang).
    *
-   * One transaction can only carry MAX_TX_INPUTS inputs, so for a large set this AUTO-LOOPS: it
-   * submits a batch of the largest ≤MAX_TX_INPUTS UTXOs, WAITS for the node to accept it and consume
-   * those inputs, then re-reads a fresh UTXO set and submits the next batch — repeating until ≤1
-   * UTXO remains. The wait between batches is essential: without it fetchEntries would return the
-   * just-spent UTXOs (still in mempool, not yet removed from the utxoindex) and the next tx would
-   * double-spend and be rejected. `onProgress` fires after each confirmed batch so the UI can show
-   * the count dropping live. Returns every batch's txid.
+   * ROUND-BASED. One transaction can only carry MAX_TX_INPUTS inputs, so a big set needs many
+   * transactions — but they do NOT need to be serialized. Each round takes ONE snapshot, partitions
+   * it into DISJOINT chunks of ≤MAX_TX_INPUTS, and submits every chunk (bounded concurrency). Since
+   * no two chunks share an input, they cannot double-spend each other. Then it waits ONCE and starts
+   * the next round over the compound outputs just created.
+   *
+   * That turns the cost from linear into logarithmic in round-trips:
+   *   40,708 UTXOs → 509 → 7 → 1   (3 rounds, ~517 txs)
+   *   247,500      → 3,094 → 39 → 1 (3 rounds)
+   * The previous one-tx-per-round-trip loop needed ~517 and ~3,134 sequential waits respectively —
+   * and its 200-batch cap meant a 40k wallet could never finish.
+   *
+   * The number of TRANSACTIONS is unchanged (mass per tx is the hard limit), so the fee is unchanged:
+   * every tx pays KERYX_MIN_FEE. Use estimateConsolidateCost() to show that before starting.
    */
   async consolidateManual(
     password: string,
@@ -1491,90 +1627,326 @@ class WalletService {
       throw new Error("Connect to a synced node first.");
     }
     // Serialize money ops (see sendManual): don't let a concurrent send/consolidate build over the
-    // same UTXO set. The whole multi-batch run holds the lock.
+    // same UTXO set. The whole multi-round run holds the lock.
     if (this.txInFlight) {
       throw new Error("Another transaction is already in progress. Please wait.");
     }
     this.txInFlight = true;
+    const keyMap = this.deriveKeyMap(password);
+    this.assertDerivationMatches(keyMap);
+    const keys = Array.from(keyMap.values());
+    const changeAddress = this.receiveAddress ?? this.accountAddresses[0];
+    if (!changeAddress) {
+      this.txInFlight = false;
+      throw new Error("No change/receive address available.");
+    }
+
+    const txids: string[] = [];
+    const run: ConsolidateRun = {
+      running: true,
+      round: 0,
+      roundsEstimate: 1,
+      startCount: 0,
+      remaining: 0,
+      txsSubmitted: 0,
+      txsFailed: 0,
+      txids,
+      feePaidSompi: 0n,
+      startedAt: Date.now(),
+      lastError: null,
+      stopRequested: false,
+      phase: "building",
+    };
+    this.consolidateRun = run;
+    this.emit();
+
     try {
-      const keyMap = this.deriveKeyMap(password);
-      this.assertDerivationMatches(keyMap);
-      const keys = Array.from(keyMap.values());
+      for (let round = 1; round <= WalletService.MAX_CONSOLIDATE_ROUNDS; round++) {
+        run.round = round;
+        run.phase = "building";
+        this.emit();
 
-      const changeAddress = this.receiveAddress ?? this.accountAddresses[0];
-      if (!changeAddress) throw new Error("No change/receive address available.");
+        // requireDaa: without the node's DAA we cannot tell mature from immature, and spending an
+        // immature input just burns a fee on a rejected tx.
+        const entries = await this.fetchEntries(true);
+        if (round === 1) {
+          run.startCount = entries.length;
+        }
+        run.remaining = entries.length;
+        run.roundsEstimate = WalletService.estimateRounds(entries.length);
+        this.emit();
 
-      const txids: string[] = [];
-      // Each batch removes at least one UTXO (used≥2 → net −(used−1)≥−1), so the loop always
-      // terminates; MAX_CONSOLIDATE_BATCHES is a backstop against an unexpected non-shrinking set.
-      for (let batch = 0; batch < WalletService.MAX_CONSOLIDATE_BATCHES; batch++) {
-        const entries = await this.fetchEntries();
         if (entries.length < 2) {
-          // Nothing (left) to consolidate. First iteration → honest error; later → we're simply done.
-          if (batch === 0) throw new Error("Nothing to consolidate (need at least 2 UTXOs).");
+          if (round === 1) throw new Error("Nothing to consolidate (need at least 2 UTXOs).");
           break;
         }
 
-        const used = entries.slice(0, WalletService.MAX_TX_INPUTS);
-        // Every UTXO in this batch must be signable, or the batch fails at submit.
-        this.assertEntriesCovered(used, keyMap);
-        const spent = new Set(used.map(outpointKey));
+        // Partition into disjoint chunks. A trailing chunk of 1 is dropped: a 1-input consolidate
+        // pays a fee to achieve nothing.
+        const chunks: any[][] = [];
+        for (let i = 0; i < entries.length; i += WalletService.MAX_TX_INPUTS) {
+          const chunk = entries.slice(i, i + WalletService.MAX_TX_INPUTS);
+          if (chunk.length >= 2) chunks.push(chunk);
+        }
+        if (chunks.length === 0) break;
+        if (run.txsSubmitted + chunks.length > WalletService.MAX_CONSOLIDATE_TXS) {
+          throw new Error(
+            `This run would need more than ${WalletService.MAX_CONSOLIDATE_TXS} transactions. ` +
+              `Consolidate in stages instead.`
+          );
+        }
 
-      // No explicit outputs → everything (minus fee) goes to the single change output = a compound.
-      const txid = await this.buildSignSubmitSync(entries, changeAddress, [], keys, 0n);
-      txids.push(txid);
-      // A consolidate is a self-send: the funds stay yours, so record it as a neutral (no +/-) entry
-      // showing the amount swept in this batch (the inputs actually used, capped at MAX_TX_INPUTS).
-      const swept = used.reduce((s, e) => s + BigInt(e.amount), 0n);
-      this.recordLocalActivity({
-        id: txid,
-        type: "consolidate",
-        direction: "other",
-        amountSompi: swept,
-        timestamp: Date.now(),
-        fromAddress: this.receiveAddress ?? undefined,
-      });
+        // Every input must be signable before we build anything.
+        for (const chunk of chunks) this.assertEntriesCovered(chunk, keyMap);
 
-      // Wait for the node to consume this batch's inputs before reading the set for the next one.
-      // If it does not confirm in time, the batches we DID submit are real and recorded — stop here
-      // and return them; the caller's live poll keeps tracking and the user can run it again.
-      let remaining: number;
-      try {
-        remaining = await this.waitForInputsConsumed(spent);
-      } catch {
-        onProgress?.({ batch: batch + 1, txid, remaining: entries.length - used.length + 1 });
-        break;
+        run.phase = "submitting";
+        this.emit();
+        const result = await this.submitChunks(chunks, changeAddress, keys, run);
+        txids.push(...result.txids);
+
+        // A whole round failing on maturity means our floor is too low for this network — raise it
+        // and retry the same round rather than reporting a confusing rejection.
+        if (result.txids.length === 0) {
+          if (result.maturityRejected && this.escalateMaturity()) {
+            run.lastError = `Node requires older inputs — waiting longer (retrying round ${round}).`;
+            this.emit();
+            round--; // retry this round with the raised floor
+            await this.sleep(5000);
+            continue;
+          }
+          throw new Error(result.firstError ?? "No transaction could be submitted.");
+        }
+
+        onProgress?.({
+          batch: run.txsSubmitted,
+          txid: result.txids[result.txids.length - 1],
+          remaining: run.remaining,
+        });
+
+        if (run.stopRequested) {
+          run.phase = "stopped";
+          break;
+        }
+
+        run.phase = "waiting";
+        this.emit();
+        // Wait for this round's inputs to be consumed AND for the new outputs to reach the maturity
+        // floor — the next round spends those outputs, and spending them too early is precisely the
+        // sequence-lock rejection this run is designed to avoid.
+        const remaining = await this.waitForRound(result.spent);
+        run.remaining = remaining;
+        this.emit();
+        if (remaining < 2) break;
       }
-      onProgress?.({ batch: batch + 1, txid, remaining });
-      if (remaining < 2) break;
-      }
 
+      run.phase = run.stopRequested ? "stopped" : "done";
       return txids;
+    } catch (e) {
+      run.phase = "failed";
+      run.lastError = e instanceof Error ? e.message : String(e);
+      throw e;
     } finally {
+      run.running = false;
       this.txInFlight = false;
+      this.emit();
+      void this.refreshBalanceFromUtxos();
+    }
+  }
+
+  /** ceil(log_MAX_TX_INPUTS(n)) — how many rounds a set of n UTXOs still needs. */
+  private static estimateRounds(n: number): number {
+    let rounds = 0;
+    let count = n;
+    while (count > 1 && rounds < WalletService.MAX_CONSOLIDATE_ROUNDS) {
+      count = Math.ceil(count / WalletService.MAX_TX_INPUTS);
+      rounds++;
+    }
+    return Math.max(1, rounds);
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  /**
+   * Build + sign + submit every chunk of one round, at most SUBMIT_CONCURRENCY in flight.
+   *
+   * A single chunk failing does NOT abort the run: its inputs simply stay unspent and reappear in the
+   * next round's snapshot, so the state self-heals. Note that a submit which TIMES OUT may still have
+   * been accepted by the node; the next round would then build over already-spent inputs and get
+   * rejected as a double-spend — harmless (no funds move, no fee) and corrected by the fresh
+   * snapshot on the round after.
+   */
+  private async submitChunks(
+    chunks: any[][],
+    changeAddress: string,
+    keys: kaspa.PrivateKey[],
+    run: ConsolidateRun
+  ): Promise<{
+    txids: string[];
+    spent: Set<string>;
+    maturityRejected: boolean;
+    firstError: string | null;
+  }> {
+    const txids: string[] = [];
+    const spent = new Set<string>();
+    let maturityRejected = false;
+    let firstError: string | null = null;
+    let next = 0;
+
+    const worker = async () => {
+      for (;;) {
+        if (run.stopRequested) return;
+        const i = next++;
+        if (i >= chunks.length) return;
+        const chunk = chunks[i];
+        // Yield to the event loop before each transaction. Building and signing are SYNCHRONOUS wasm
+        // calls (80 inputs each), so without this a 500-tx round would freeze the window solid — no
+        // repaint, no progress, no Stop button. The await lets React paint between transactions.
+        await this.sleep(0);
+        try {
+          // No explicit outputs → everything minus the fee goes to one change output = a compound.
+          const txid = await this.buildSignSubmitSync(chunk, changeAddress, [], keys, 0n);
+          txids.push(txid);
+          chunk.forEach((e) => spent.add(outpointKey(e)));
+          run.txsSubmitted++;
+          run.feePaidSompi += WalletService.KERYX_MIN_FEE;
+          // A consolidate is a self-send: funds stay yours, so record it as a neutral entry showing
+          // the amount swept by this transaction.
+          this.recordLocalActivity({
+            id: txid,
+            type: "consolidate",
+            direction: "other",
+            amountSompi: chunk.reduce((s: bigint, e: any) => s + BigInt(e.amount), 0n),
+            timestamp: Date.now(),
+            fromAddress: this.receiveAddress ?? undefined,
+          });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          run.txsFailed++;
+          if (WalletService.isMaturityRejection(msg)) maturityRejected = true;
+          if (firstError === null) firstError = msg;
+          run.lastError = msg;
+        }
+        this.emit();
+      }
+    };
+
+    const lanes = Math.min(WalletService.SUBMIT_CONCURRENCY, chunks.length);
+    await Promise.all(Array.from({ length: lanes }, () => worker()));
+    return { txids, spent, maturityRejected, firstError };
+  }
+
+  /**
+   * Wait for a round to settle: none of its inputs left in our UTXO set, then a maturity pause so
+   * the freshly created compound outputs are actually spendable in the next round.
+   *
+   * Uses the cheap outpoint-only read (fetchOutpointKeys) with a growing interval — on a 250k-UTXO
+   * wallet the old full mapped fetch every 2.5s was itself the bottleneck. Returns the remaining
+   * UTXO count.
+   */
+  private async waitForRound(spent: Set<string>, timeoutMs = 600000): Promise<number> {
+    const deadline = Date.now() + timeoutMs;
+    let pollMs = 2500;
+    let keys = await this.fetchOutpointKeys();
+    for (;;) {
+      let stillThere = false;
+      for (const k of spent) {
+        if (keys.has(k)) {
+          stillThere = true;
+          break;
+        }
+      }
+      if (!stillThere) break;
+      if (Date.now() > deadline) {
+        throw new Error(
+          "The consolidation transactions did not confirm in time. The ones already submitted are " +
+            "real — check your UTXO count and run it again if needed."
+        );
+      }
+      await this.sleep(pollMs);
+      pollMs = Math.min(pollMs * 1.5, 10000);
+      keys = await this.fetchOutpointKeys();
+    }
+    // Inputs are consumed, so the new outputs exist. Let them age past the user-tx maturity floor
+    // before the next round spends them. DAA advances ~1/s, so this is seconds, once per round.
+    await this.waitForMaturity();
+    return (await this.fetchOutpointKeys()).size;
+  }
+
+  /** Pause until the DAA score has advanced past the user-tx maturity floor (plus a small margin). */
+  private async waitForMaturity(): Promise<void> {
+    const startDaa = this.nodeDaa;
+    if (startDaa == null) {
+      await this.sleep(Number(this.userTxMaturity) * 1000);
+      return;
+    }
+    const target = startDaa + this.userTxMaturity + 2n;
+    const deadline = Date.now() + 180000;
+    for (;;) {
+      let daa = this.nodeDaa;
+      try {
+        const info = await this.wallet!.rpc.getServerInfo();
+        daa = info.virtualDaaScore;
+        this.nodeDaa = daa;
+      } catch {
+        /* keep the cached value; the status poll also refreshes it */
+      }
+      if (daa != null && daa >= target) return;
+      if (Date.now() > deadline) return; // don't stall the run on a slow DAA read
+      await this.sleep(2000);
     }
   }
 
   /**
-   * Poll the node until NONE of the given input outpoints remain in our UTXO set — i.e. the batch we
-   * just submitted has been accepted into the DAG and its inputs consumed (the new compound output
-   * is then present too). Returns the remaining UTXO count. Time-boxed so a tx that never confirms
-   * surfaces as an error instead of spinning forever.
+   * What a full consolidation of the CURRENT set would cost, before committing to it. Every
+   * transaction pays KERYX_MIN_FEE, and a large miner wallet needs thousands of them — at 250k UTXOs
+   * that is ~940 KRX, which the user must see up front rather than discover afterwards.
    */
-  private async waitForInputsConsumed(
-    spent: Set<string>,
-    timeoutMs = 120000,
-    pollMs = 2500
-  ): Promise<number> {
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      const entries = await this.fetchEntries();
-      if (!entries.some((e) => spent.has(outpointKey(e)))) return entries.length;
-      if (Date.now() > deadline) {
-        throw new Error("Consolidation batch did not confirm in time.");
-      }
-      await new Promise((r) => setTimeout(r, pollMs));
+  async estimateConsolidateCost(): Promise<{
+    utxoCount: number;
+    txCount: number;
+    rounds: number;
+    feeSompi: bigint;
+  }> {
+    const { count } = await this.utxoStats();
+    let txCount = 0;
+    let remaining = count;
+    while (remaining > 1 && txCount <= WalletService.MAX_CONSOLIDATE_TXS) {
+      const txs = Math.floor(remaining / WalletService.MAX_TX_INPUTS);
+      const tail = remaining % WalletService.MAX_TX_INPUTS;
+      const thisRound = txs + (tail >= 2 ? 1 : 0);
+      if (thisRound === 0) break;
+      txCount += thisRound;
+      remaining = thisRound + (tail === 1 ? 1 : 0);
     }
+    return {
+      utxoCount: count,
+      txCount,
+      rounds: WalletService.estimateRounds(count),
+      feeSompi: BigInt(txCount) * WalletService.KERYX_MIN_FEE,
+    };
+  }
+
+  /** Discard a finished run's state so the UI returns to the start form. No-op while one runs. */
+  clearConsolidateRun(): void {
+    if (this.consolidateRun && !this.consolidateRun.running) {
+      this.consolidateRun = null;
+      this.emit();
+    }
+  }
+
+  /** Ask the running consolidation to stop. It finishes the current round first — never mid-round. */
+  stopConsolidate(): void {
+    if (this.consolidateRun?.running) {
+      this.consolidateRun.stopRequested = true;
+      this.emit();
+    }
+  }
+
+  /** True while a consolidation is in progress (used to hold off the auto-lock). */
+  get isConsolidating(): boolean {
+    return this.consolidateRun?.running === true;
   }
 
   /**
@@ -1586,7 +1958,13 @@ class WalletService {
     if (!this.wallet || this.activeAddresses().length === 0) {
       return { count: 0, totalSompi: 0n };
     }
-    const res = await this.wallet.rpc.getUtxosByAddresses(this.activeAddresses());
+    // Time-boxed like the other UTXO reads: the UI polls this every few seconds and on a very large
+    // wallet the response is big enough to hang without a guard.
+    const res = await this.withTimeout(
+      this.wallet.rpc.getUtxosByAddresses(this.activeAddresses()),
+      WalletService.UTXO_FETCH_TIMEOUT_MS,
+      "utxo-fetch"
+    );
     const entries = (res?.entries ?? []) as Array<{ amount?: bigint }>;
     let total = 0n;
     for (const e of entries) {
