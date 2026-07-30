@@ -1,4 +1,4 @@
-# Keryx wallet — WASM SDK contract (verified, do not invent)
+# Keryx wallet WASM SDK contract (verified, do not invent)
 
 The GUI reuses the **audited Keryx wallet-core** compiled to WASM (`src/sdk/kaspa.{js,d.ts}` + `kaspa_bg.wasm`).
 All snippets below are verified against `src/sdk/kaspa.d.ts` (cited `kaspa.d.ts:N`) and the official
@@ -27,20 +27,20 @@ await rpc.connect();                                   // kaspa.d.ts:6758
 const { isSynced, virtualDaaScore } = await rpc.getServerInfo();
 ```
 
-## Wallet (class `Wallet`, kaspa.d.ts:7519) — storage is INTERNAL (localStorage+IndexedDB, Argon2+XChaCha20)
+## Wallet (class `Wallet`, kaspa.d.ts:7519): storage is INTERNAL (localStorage+IndexedDB, Argon2+XChaCha20)
 ```ts
 const wallet = new kaspa.Wallet({ resident:false, networkId:"mainnet", url:"ws://127.0.0.1:23110" }); // IWalletConfig 4107
 // CREATE (show the mnemonic for backup BEFORE persisting):
-const m = kaspa.Mnemonic.random(24);                   // kaspa.d.ts:5654 — show m.phrase to user
+const m = kaspa.Mnemonic.random(24);                   // kaspa.d.ts:5654; show m.phrase to user
 await wallet.walletCreate({ walletSecret, filename:"main", title:"Main" });   // 7558
 const pk = await wallet.prvKeyDataCreate({ walletSecret, mnemonic:m.phrase }); // 7658
 await wallet.accountsCreate({ walletSecret, type:"bip32", accountName:"Account 1", prvKeyDataId:pk.prvKeyDataId }); // 7583
-// IMPORT existing phrase: same prvKeyDataCreate({mnemonic}) + accountsCreate (NOT walletImport — that takes an encrypted blob).
+// IMPORT existing phrase: same prvKeyDataCreate({mnemonic}) + accountsCreate (NOT walletImport; that takes an encrypted blob).
 // OPEN / UNLOCK:
 const { accountDescriptors } = await wallet.walletOpen({ walletSecret, filename:"main", accountDescriptors:true }); // 7538
 await wallet.accountsActivate({ accountIds:[accountDescriptors[0].accountId] }); // 7608
 await wallet.connect(); await wallet.start();          // 7750 / 7745
-await wallet.exists("main");                            // 7749 — gate onboarding vs unlock
+await wallet.exists("main");                            // 7749; gate onboarding vs unlock
 ```
 
 ## Receive
@@ -49,7 +49,7 @@ const addr = acc.receiveAddress.toString();             // from IAccountDescript
 // new address: wallet.accountsCreateNewAddress({ accountId, addressKind:kaspa.NewAddressKind.Receive }) // 7718
 ```
 
-## Balance — via EVENTS (no sync getter)
+## Balance: via EVENTS (no sync getter)
 ```ts
 wallet.addEventListener(({type,data}) => {
   if (type==="balance") { /* data.balance.mature, data.balance.pending (sompi, bigint) */ }  // IBalanceEvent 4464

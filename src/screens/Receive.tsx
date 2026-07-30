@@ -118,7 +118,7 @@ export function Receive({ onClose }: { onClose: () => void }) {
             </div>
             {!w.canAddReceiveAddress && (
               <p className="mt-2 w-full text-center text-xs text-emerald-200/40">
-                This wallet keeps up to 3 addresses — switch between them above.
+                This wallet keeps up to 3 addresses. Switch between them above.
               </p>
             )}
           </>

@@ -1,4 +1,4 @@
-# Keryx Wallet — QA / Test Plan (V21)
+# Keryx Wallet QA / Test Plan (V21)
 
 Light wallet; talks to a Keryx node's wRPC. **All money tests must be run against a real, synced node**
 (via the SSH tunnel so the wallet's default `ws://127.0.0.1:23110` reaches the node). Use small amounts.
@@ -13,22 +13,22 @@ Legend: ⬜ = to run, note PASS/FAIL + what you saw.
 - ⬜ Boot log shows `address prefix verified: keryx` (run via `npm run tauri dev` if you want the console; the portable has no console).
 
 ## 1. New fixes in V21 (the point of this build)
-**A5 — send is blocked on an un-synced node**
+**A5: send is blocked on an un-synced node**
 - ⬜ With the node still syncing (or right after connect, before "synced"), try **Send** → must refuse with
   *"Connect to a synced node first."* and NOT build/sign anything. (Consolidate already did this; now send matches.)
 
-**A2 — largest-UTXO-first selection**
+**A2: largest-UTXO-first selection**
 - ⬜ On a wallet with several UTXOs, do a normal small send → succeeds. (Regression-safe; ordering is internal.)
 - ⬜ If you can arrange a wallet whose balance is spread across many UTXOs, send an amount that a few large
   UTXOs cover → it should fund from the **largest** ones and succeed (previously could falsely fail).
 
-**A1 — honest message when funds span >80 UTXOs**
+**A1: honest message when funds span >80 UTXOs**
 - ⬜ Only reproducible with >80 UTXOs. Try to send an amount larger than the 80 largest UTXOs combined →
   message must say *"This amount needs more than 80 UTXOs in one transaction. Consolidate your funds first, then send."*
   (NOT the old misleading "Amount exceeds your spendable balance"). Then **Consolidate**, then retry the send → succeeds.
 - ⬜ Sanity: on a normal wallet, trying to send MORE than you own still says *"Amount exceeds your spendable balance."*
 
-## 2. Core money flows (regressions — must still work exactly like V20)
+## 2. Core money flows (regressions: must still work exactly like V20)
 - ⬜ **Consolidate** a wallet with ≥2 UTXOs → returns txid(s); after maturity the UTXO count drops. (This is the V20-proven path.)
 - ⬜ **Send** to a second address you control → txid returned; recipient balance rises; sender drops by amount+fee.
 - ⬜ **Estimate fee** before a send shows a fee ≥ 0.3 KRX (the KERYX_MIN_FEE floor) and the confirmed fee matches.
@@ -50,7 +50,7 @@ Legend: ⬜ = to run, note PASS/FAIL + what you saw.
 - ⬜ Send **0** or a negative/garbage amount → rejected.
 - ⬜ Send an amount equal to full balance (no room for fee) → rejected with *"Amount + network fee exceeds your balance."*
 - ⬜ **Double-submit**: on the confirm screen, click "Confirm & send" fast/twice → must NOT broadcast two txs
-  (only one txid; the second click is ignored or errors). *(Known narrow window — flag if you ever see 2 txids.)*
+  (only one txid; the second click is ignored or errors). *(Known narrow window; flag if you ever see 2 txids.)*
 - ⬜ **Auto-lock**: leave the app idle → it locks; unlock works.
 
 ## 5. Chain-safety / "don't break or get hacked" checks
@@ -67,7 +67,7 @@ Legend: ⬜ = to run, note PASS/FAIL + what you saw.
 ## 6. After all green
 - ⬜ Keep V20 as the rollback. If V21 passes 1–5, it becomes the new GOOD build.
 - ⬜ Then proceed to the GitHub prep (delete `WALLET_DEBUG_HANDOFF.md`, scrub node IP, extend `.gitignore`,
-  rotate any token) and push to a `keryxpool/*` branch for the dev — NEVER `main`.
+  rotate any token) and push to a `keryxpool/*` branch for the dev, NEVER `main`.
 
 ---
 ### Notes column

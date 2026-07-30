@@ -1,6 +1,6 @@
 # Testing the Keryx Wallet on the node box
 
-The wallet is a **light wallet**: it has no embedded node and syncs nothing itself — it talks to a
+The wallet is a **light wallet**: it has no embedded node and syncs nothing itself; it talks to a
 Keryx node's wRPC. Easiest test setup: run the wallet **on the same Linux machine as `keryxd`**.
 
 ## Prerequisites
@@ -11,11 +11,11 @@ Keryx node's wRPC. Easiest test setup: run the wallet **on the same Linux machin
 
 ## Install / run
 ```bash
-# Option A — install the built package:
+# Option A: install the built package:
 sudo dpkg -i "src-tauri/target/release/bundle/deb/Keryx Wallet_0.1.0_amd64.deb" || sudo apt-get -f install
 keryx-wallet            # launch from menu or this command
 
-# Option B — run from source (dev):
+# Option B: run from source (dev):
 npm install && npm run tauri dev
 ```
 
@@ -28,7 +28,7 @@ npm install && npm run tauri dev
    - The dashboard **balance** (mature/pending) and **activity** list should update within seconds.
 5. **Send** → paste a destination, amount → *Estimate fee* → review → password → confirm → you get txid(s).
    The activity list should show the outgoing tx.
-6. **Settings → Recovery phrase**: reveal it (re-enter password) — must match what you wrote down.
+6. **Settings → Recovery phrase**: reveal it (re-enter password); it must match what you wrote down.
 7. **Settings → Export encrypted wallet** → saves `keryx-wallet-backup.txt`.
    **Settings → Change password** → change it, then lock + unlock with the new one.
 8. **Restore round-trip**: on a fresh machine/profile, either **Import recovery phrase** (the 24 words)
@@ -38,7 +38,7 @@ npm install && npm run tauri dev
 - Address prefix is **`keryx:`** (the bundled SDK is the Keryx build; logged on boot as
   `[wallet] address prefix verified: keryx`). If it logs something else, tell me.
 - **Balance / activity** arrive via SDK events; if the balance shows 0 after funding, the event field
-  shape may differ from what we handled defensively — note the exact behavior and we'll align it.
+  shape may differ from what we handled defensively; note the exact behavior and we'll align it.
 - **Send** signs with `accountsSend`; the fee shown at confirm is the one signed (amounts are frozen).
 
 ## Troubleshooting

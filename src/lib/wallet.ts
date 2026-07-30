@@ -1270,7 +1270,7 @@ class WalletService {
     const probe = this.receiveAddress ?? this.accountAddresses[0];
     if (probe && !keyMap.has(probe)) {
       throw new Error(
-        "Key derivation does not match this wallet's addresses — aborting to avoid signing with " +
+        "Key derivation does not match this wallet's addresses. Aborting to avoid signing with " +
           "the wrong keys. (Manual transaction path disabled for safety.)"
       );
     }
@@ -1291,7 +1291,7 @@ class WalletService {
     if (uncovered.length > 0) {
       throw new Error(
         `${uncovered.length} of your UTXOs are on addresses this wallet cannot derive a signing ` +
-          `key for — aborting to avoid building an unspendable transaction.`
+          `key for. Aborting to avoid building an unspendable transaction.`
       );
     }
   }
@@ -1571,7 +1571,7 @@ class WalletService {
       // fee, so a deficit means the balance is below the fee, not that an amount is too large.
       throw new Error(
         targetOutputs.length === 0
-          ? "Your total balance is below the minimum network fee — nothing to consolidate."
+          ? "Your total balance is below the minimum network fee, so there is nothing to consolidate."
           : "Amount + network fee exceeds your balance."
       );
     }
@@ -1748,7 +1748,7 @@ class WalletService {
             chunks.length = Math.max(0, budgetTxs);
             if (chunks.length === 0) {
               run.lastError =
-                "Reached the fee amount you accepted — stopping here. " +
+                "Reached the fee amount you accepted, stopping here. " +
                 "Run Consolidate again to continue.";
               run.phase = "stopped";
               break;
@@ -1773,7 +1773,7 @@ class WalletService {
             break;
           }
           if (result.maturityMsg !== null && this.escalateMaturity(result.maturityMsg)) {
-            run.lastError = `Node requires older inputs — waiting longer (retrying round ${round}).`;
+            run.lastError = `Node requires older inputs, waiting a bit longer (retrying round ${round}).`;
             this.emit();
             round--; // retry this round with the raised floor
             await this.sleep(5000);
@@ -1941,7 +1941,7 @@ class WalletService {
       if (Date.now() > deadline) {
         throw new Error(
           "The consolidation transactions did not confirm in time. The ones already submitted are " +
-            "real — check your UTXO count and run it again if needed."
+            "real. Check your UTXO count and run it again if needed."
         );
       }
       await this.sleep(pollMs);
@@ -2107,7 +2107,7 @@ class WalletService {
     // Same reason as selectReceiveAddress: this switches the active address.
     if (this.txInFlight) {
       throw new Error(
-        "A transaction or consolidation is in progress — stop it before switching accounts."
+        "A transaction or consolidation is in progress. Stop it before switching accounts."
       );
     }
     if (this.receiveAddresses.length >= WalletService.MAX_RECEIVE_ADDRESSES) {
@@ -2159,7 +2159,7 @@ class WalletService {
     // UTXOs into the old account's address — refuse until it finishes or is stopped.
     if (this.txInFlight) {
       throw new Error(
-        "A transaction or consolidation is in progress — stop it before switching accounts."
+        "A transaction or consolidation is in progress. Stop it before switching accounts."
       );
     }
     if (!this.receiveAddresses.includes(addr)) {

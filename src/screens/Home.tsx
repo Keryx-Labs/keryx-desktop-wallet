@@ -169,7 +169,7 @@ export function Home() {
         </div>
         {!canTransact && (
           <p className="mt-3 text-xs text-amber-300/80">
-            Not connected — sending is disabled.
+            Not connected. Sending is disabled.
           </p>
         )}
         <div className="mt-3 flex gap-2">

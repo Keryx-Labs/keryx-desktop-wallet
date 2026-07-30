@@ -2,17 +2,17 @@
 
 A lightweight, self-custodial desktop wallet for the **Keryx** network, available for **Linux** and **Windows**.
 
-Your keys never leave your device. The recovery phrase is encrypted at rest, and every spend is confirmed and signed locally — the wallet only talks to a Keryx node to read balances and broadcast transactions.
+Your keys never leave your device. The recovery phrase is encrypted at rest, and every spend is confirmed and signed locally; the wallet only talks to a Keryx node to read balances and broadcast transactions.
 
 <p align="center">
-  <img src="docs/screenshots/welcome.png" alt="Keryx Wallet — welcome screen" width="640">
+  <img src="docs/screenshots/welcome.png" alt="Keryx Wallet welcome screen" width="640">
 </p>
 
 ## Download
 
 Prebuilt binaries are attached to each [GitHub Release](../../releases):
 
-- **Windows:** `.msi` or `.exe` installer, or the standalone **portable** `.exe` (no install — just run it).
+- **Windows:** `.msi` or `.exe` installer, or the standalone **portable** `.exe` (no install, just run it).
 - **Linux:** `.deb` or `.AppImage`.
 
 ## Features
@@ -26,7 +26,7 @@ Prebuilt binaries are attached to each [GitHub Release](../../releases):
 
 ## Requirements
 
-- A reachable Keryx node wRPC (Borsh) endpoint — default `ws://127.0.0.1:23110` — started with `--utxoindex`.
+- A reachable Keryx node wRPC (Borsh) endpoint (default `ws://127.0.0.1:23110`) started with `--utxoindex`.
 - For development: Node 20+, Rust (stable), and the Tauri Linux dependencies:
   `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`.
 
@@ -58,7 +58,7 @@ git push origin v0.1.0
 ```
 
 - Windows: `.msi` (WiX), `.exe` (NSIS) installer, and a standalone portable `.exe`. Linux: `.deb` and `.AppImage`.
-- All artifacts land on a single draft Release. See `.github/workflows/release.yml` — the release is created as a draft, so review and publish it manually.
+- All artifacts land on a single draft Release (see `.github/workflows/release.yml`). The release stays a draft so you can review it and publish manually.
 
 ## Architecture
 
@@ -72,20 +72,20 @@ ecosystem. Regenerating the SDK from a newer node release is documented in `SDK_
 - The recovery phrase is encrypted at rest (Argon2 key derivation, XChaCha20-Poly1305 encryption) and
   is never written to logs. Keys are derived in memory only, and the password is requested again for
   every send.
-- A send freezes the confirmed amounts — what you confirm is exactly what is signed — and validates the
-  destination address and network beforehand.
+- A send validates the destination address and network first, then freezes the confirmed amounts:
+  what you confirm is exactly what gets signed.
 - A strict Content Security Policy blocks remote content and inline/eval scripts, and Tauri capabilities
   are limited to the defaults.
 
 ## Support the project
 
 Keryx Wallet is free and open source. If it's useful to you and you'd like to help its
-development, donations are very welcome — thank you!
+development, donations are very welcome. Thank you!
 
 - **KRX (Keryx):** `keryx:qpx2alq86yev9xs3jqf3endplycf27vq3qxf7gaxvxnedacnl7y0xyvwq3slp`
-- **USDT / USDC (EVM — Ethereum, BNB Chain, and other EVM networks):** `0xe5c66e65a5b2085e5313796dd2a1C90aB276cD8d`
-  _(EVM / ERC-20 / BEP-20 tokens only — do not send from non-EVM chains.)_
+- **USDT / USDC (EVM: Ethereum, BNB Chain, and other EVM networks):** `0xe5c66e65a5b2085e5313796dd2a1C90aB276cD8d`
+  _(EVM / ERC-20 / BEP-20 tokens only; do not send from non-EVM chains.)_
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+MIT. See [`LICENSE`](LICENSE).

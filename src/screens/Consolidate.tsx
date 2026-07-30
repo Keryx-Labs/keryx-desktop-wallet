@@ -171,7 +171,7 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
         {busy ? (
           <>
             <p className="mb-3 text-sm leading-relaxed text-emerald-100/70">
-              Consolidating. This keeps running if you close this window — reopen it any time to see
+              Consolidating. This keeps running if you close this window; reopen it any time to see
               where it is. Stopping finishes the transaction in flight and then halts; UTXOs already
               swept stay swept.
             </p>
@@ -214,7 +214,7 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
               {finished.txsFailed > 0 ? ` · ${finished.txsFailed} failed` : ""}.{" "}
               {count <= 1
                 ? "Everything is consolidated into a single UTXO."
-                : `${count} UTXOs remain — run it again if that is still more than you want.`}{" "}
+                : `${count} UTXOs remain. Run it again if that is still more than you want.`}{" "}
               The consolidated balance becomes spendable after it matures.
             </p>
 
@@ -270,7 +270,7 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
           <>
             <p className="mb-4 text-sm leading-relaxed text-emerald-100/70">
               Combines your many small UTXOs into one by sending them back to yourself. Handy for
-              mining payouts. It runs in rounds — each round sweeps everything it can in parallel, so
+              mining payouts. It runs in rounds: each round sweeps everything it can in parallel, so
               even a very large wallet finishes in a few rounds.
             </p>
 
@@ -307,7 +307,7 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
                 </dl>
                 <p className="mt-2 text-[10px] leading-relaxed text-amber-200/60">
                   An upper bound: immature mining rewards are skipped this run, so the real total can
-                  be lower. Each transaction pays the network minimum — the count is set by the
+                  be lower. Each transaction pays the network minimum, and the count is set by the
                   per-transaction input limit, not by us.
                 </p>
                 <label className="mt-3 flex cursor-pointer items-start gap-2 text-[11px] text-amber-200">

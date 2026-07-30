@@ -102,7 +102,7 @@ function CreateFlow({ onCancel, onReady }: { onCancel: () => void; onReady: () =
         <div className="mt-4 flex items-center justify-end gap-2">
           <span className="mr-auto text-xs text-emerald-200/40">
             {copied
-              ? "Copied — clipboard auto-clears in ~60s"
+              ? "Copied (clipboard auto-clears in ~60s)"
               : "Writing it down is safer than copying"}
           </span>
           <button className="btn-ghost" onClick={copyPhrase}>
@@ -183,7 +183,7 @@ function ImportFlow({ onCancel, onReady }: { onCancel: () => void; onReady: () =
           />
           <p className="mt-1 text-xs text-emerald-200/40">
             {wordCount} word{wordCount === 1 ? "" : "s"}
-            {wordCount > 0 && !validLen ? " — expected 12 or 24" : ""}
+            {wordCount > 0 && !validLen ? " (expected 12 or 24)" : ""}
           </p>
         </div>
       }
@@ -219,7 +219,7 @@ function RestoreFileFlow({ onCancel, onReady }: { onCancel: () => void; onReady:
       submitLabel="Restore wallet"
       extra={
         <div className="mb-4">
-          <label className="label">Backup file (.txt) — or paste its contents</label>
+          <label className="label">Backup file (.txt), or paste its contents</label>
           <input
             type="file"
             accept=".txt,.dat,text/plain"
@@ -234,7 +234,7 @@ function RestoreFileFlow({ onCancel, onReady }: { onCancel: () => void; onReady:
           />
           <p className="mt-1 text-xs text-emerald-200/40">
             Enter the password the file was exported with. (Reveal-phrase is not
-            available for a file restore — use phrase import if you need it.)
+            available for a file restore; use phrase import if you need it.)
           </p>
         </div>
       }

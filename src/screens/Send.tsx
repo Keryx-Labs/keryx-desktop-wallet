@@ -60,7 +60,7 @@ export function Send({ onClose }: { onClose: () => void }) {
       return false;
     }
     if (!w.synced) {
-      setErr("Node is not synced yet — please wait.");
+      setErr("Node is not synced yet. Please wait.");
       return false;
     }
     if (!wallet.validateAddress(dest)) {
@@ -120,7 +120,7 @@ export function Send({ onClose }: { onClose: () => void }) {
       return;
     }
     if (!w.synced) {
-      setErr("Node is not synced — please wait.");
+      setErr("Node is not synced. Please wait.");
       return;
     }
     if (!wallet.validateAddress(frozen.dest)) {
@@ -169,7 +169,7 @@ export function Send({ onClose }: { onClose: () => void }) {
           <p className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5 text-xs text-amber-300">
             {w.conn !== "connected"
               ? "Not connected to a node."
-              : "Node is still syncing — sending is disabled until synced."}
+              : "Node is still syncing. Sending is disabled until it catches up."}
           </p>
         )}
 
