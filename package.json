@@ -11,6 +11,7 @@
     "dev:capture": "tauri dev --config src-tauri/tauri.capture.conf.json"
   },
   "dependencies": {
+    "@noble/hashes": "^2.4.0",
     "@tauri-apps/api": "^2.0.0",
     "qrcode": "^1.5.4",
     "react": "^18.3.1",

@@ -10,8 +10,10 @@ import {
   ModelName,
   RequestUtxo,
   MIN_AI_REQUEST_PRIORITY_FEE,
+  hexToBytes,
 } from "./aiRequest";
 import { escrowForModel } from "./aiCaps";
+import { blake2b } from "@noble/hashes/blake2.js";
 import {
   parseAiResponse,
   ipfsUrl,
@@ -89,6 +91,9 @@ export interface NodeSettings {
   url: string;
   networkId: string;
 }
+
+/** Domain of the H6 escrow delegation message, as verified by the miner and the node. */
+const ESCROW_DELEGATION_DOMAIN = "KeryxEscrowDelegationV1";
 
 /** Public Keryx Labs nodes, one per network. */
 export const DEFAULT_NODES: Record<string, NodeSettings> = {
@@ -2302,6 +2307,35 @@ class WalletService {
     } finally {
       this.txInFlight = false;
     }
+  }
+
+  /**
+   * Sign the H6 escrow delegation for a miner: a Schnorr signature by the active receive
+   * address's key over blake2b-256(domain || escrow_pubkey). The miner passes the 128-hex
+   * result as `--escrow-cert`; from H6 a block without a valid key/cert pair is invalid.
+   */
+  signEscrowDelegation(password: string, escrowPubkeyHex: string): { cert: string; address: string } {
+    if (!this.isOpen) throw new Error("Open the wallet first.");
+    const escrowPubkey = escrowPubkeyHex.trim().toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(escrowPubkey)) {
+      throw new Error("The escrow key must be 64 hex characters — copy the line the miner prints at startup.");
+    }
+    const address = this.receiveAddress;
+    if (!address) throw new Error("No receive address available.");
+    const keyMap = this.deriveKeyMap(password); // throws "Wrong password." on bad pw
+    const key = keyMap.get(address);
+    if (!key) throw new Error("The active receive address is not derivable from this wallet.");
+    const message = blake2b
+      .create({ dkLen: 32 })
+      .update(new TextEncoder().encode(ESCROW_DELEGATION_DOMAIN))
+      .update(hexToBytes(escrowPubkey))
+      .digest();
+    // signScriptHash takes the hash as hex and returns a 66-byte signature script:
+    // 0x41, the 64 Schnorr bytes, SigHash.
+    const messageHex = Array.from(message, (b) => b.toString(16).padStart(2, "0")).join("");
+    const sigScript = kaspa.signScriptHash(messageHex, key);
+    if (sigScript.length !== 132) throw new Error("Unexpected signature length from the SDK.");
+    return { cert: sigScript.slice(2, 130), address };
   }
 
   /**

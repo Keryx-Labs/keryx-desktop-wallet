@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { DEFAULT_NODES, NodeSettings, wallet } from "../lib/wallet";
+import { useWalletState } from "../lib/useWallet";
 import { Modal } from "./Modal";
 
 const DEFAULT_PORT = "23110"; // Keryx Borsh wRPC default
@@ -197,6 +198,7 @@ export function NodeSettingsModal({
         {wallet.hasSeedBackup() && <RevealPhraseSection />}
         {wallet.isOpen && <ChangePasswordSection />}
         {wallet.isOpen && <ExportWalletSection />}
+        {wallet.isOpen && <AuthoriseMinerSection />}
     </Modal>
   );
 }
@@ -538,6 +540,113 @@ function RevealPhraseSection() {
             </button>
           </div>
         </>
+      )}
+    </div>
+  );
+}
+
+function AuthoriseMinerSection() {
+  const w = useWalletState();
+  const [open, setOpen] = useState(false);
+  const [escrowKey, setEscrowKey] = useState("");
+  const [password, setPassword] = useState("");
+  const [cert, setCert] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  function reset() {
+    setOpen(false);
+    setEscrowKey("");
+    setPassword("");
+    setCert(null);
+    setErr(null);
+    setCopied(false);
+  }
+
+  function authorise() {
+    setErr(null);
+    setCert(null);
+    setCopied(false);
+    try {
+      const r = wallet.signEscrowDelegation(password, escrowKey);
+      setPassword("");
+      setCert(r.cert);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not sign the delegation.");
+    }
+  }
+
+  function copy() {
+    if (!cert) return;
+    navigator.clipboard
+      ?.writeText(`--escrow-cert ${cert}`)
+      .then(() => setCopied(true))
+      .catch(() => {});
+  }
+
+  const addr = w.receiveAddress ?? "";
+  const shortAddr = addr ? `${addr.slice(0, 14)}…${addr.slice(-6)}` : "";
+
+  return (
+    <div className="mt-4 border-t border-keryx-border pt-4">
+      <h3 className="section-label">Authorise a miner</h3>
+      <p className="mb-3 text-xs leading-relaxed text-keryx-dim">
+        From the H6 hardfork a miner must prove it works for your address. Paste the escrow key
+        it prints at startup — signed once, valid as long as you keep that pair. The cert is
+        bound to the active receive address ({shortAddr}).
+      </p>
+      {!open && (
+        <button className="btn-ghost w-full" onClick={() => setOpen(true)}>
+          Authorise a miner
+        </button>
+      )}
+      {open && (
+        <div>
+          <label className="label">Escrow key printed by the miner (64 hex)</label>
+          <input
+            className="input mb-3 font-mono text-xs"
+            value={escrowKey}
+            onChange={(e) => setEscrowKey(e.target.value)}
+            placeholder="66aef947…"
+            autoFocus
+          />
+          <label className="label">Password</label>
+          <input
+            type="password"
+            className="input mb-3"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+          {err && <p className="mb-3 text-sm text-keryx-error">{err}</p>}
+          <div className="flex gap-2">
+            <button className="btn-ghost flex-1" onClick={reset}>
+              Close
+            </button>
+            <button
+              className="btn-primary flex-1"
+              onClick={authorise}
+              disabled={escrowKey.trim().length === 0 || password.length === 0}
+            >
+              Authorise →
+            </button>
+          </div>
+          {cert && (
+            <div className="mt-3">
+              <p className="mb-1 text-xs text-keryx-dim">Add this to your miner — nothing else changes:</p>
+              <code className="block break-all rounded-sm border border-keryx-border bg-keryx-green/[0.03] p-2 text-xs text-keryx-green">
+                --escrow-cert {cert}
+              </code>
+              <div className="mt-2 flex items-center gap-3">
+                <button className="btn-ghost px-3 py-1.5 text-xs" onClick={copy}>
+                  {copied ? "✓ copied" : "Copy"}
+                </button>
+                <span className="text-xs text-keryx-dim">
+                  Mine to {shortAddr} — the cert only verifies against it.
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
       )}
     </div>
   );
