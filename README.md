@@ -29,7 +29,7 @@ Prebuilt binaries are attached to each [GitHub Release](../../releases):
 
 ## Requirements
 
-- A reachable Keryx node wRPC (Borsh) endpoint (default `ws://127.0.0.1:23110`) started with `--utxoindex`.
+- A reachable Keryx node wRPC (Borsh) endpoint started with `--utxoindex`. By default the wallet uses the Keryx Labs public node (`wss://node.keryx-labs.com:23110` for mainnet, `:23210` for testnet-10); a local node such as `ws://127.0.0.1:23110` can be set in the node settings.
 - For development: Node 20+ and Rust (stable), plus the per-OS Tauri dependencies:
   - **macOS:** Xcode Command Line Tools (`xcode-select --install`). To build a universal `.dmg`, add both Rust targets: `rustup target add aarch64-apple-darwin x86_64-apple-darwin`.
   - **Linux:** `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`.

@@ -90,10 +90,13 @@ export interface NodeSettings {
   networkId: string;
 }
 
-export const DEFAULT_NODE: NodeSettings = {
-  url: "ws://127.0.0.1:23110",
-  networkId: "mainnet",
+/** Public Keryx Labs nodes, one per network. */
+export const DEFAULT_NODES: Record<string, NodeSettings> = {
+  mainnet: { url: "wss://node.keryx-labs.com:23110", networkId: "mainnet" },
+  "testnet-10": { url: "wss://node.keryx-labs.com:23210", networkId: "testnet-10" },
 };
+
+export const DEFAULT_NODE: NodeSettings = DEFAULT_NODES.mainnet;
 
 /** One user-visible wallet: its own recovery phrase, its own account, its own addresses. */
 export interface WalletEntry {

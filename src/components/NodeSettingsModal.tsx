@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { NodeSettings, wallet } from "../lib/wallet";
+import { DEFAULT_NODES, NodeSettings, wallet } from "../lib/wallet";
 import { Modal } from "./Modal";
 
 const DEFAULT_PORT = "23110"; // Keryx Borsh wRPC default
@@ -41,6 +41,18 @@ export function NodeSettingsModal({
   const [autoLockMinutes, setAutoLockMinutes] = useState(String(initialAutoLockMinutes));
   const [testing, setTesting] = useState(false);
   const [testMsg, setTestMsg] = useState<{ ok: boolean; text: string } | null>(null);
+
+  // Switching network points the form at that network's public node; the fields stay editable.
+  function selectNetwork(id: string) {
+    setNetworkId(id);
+    setTestMsg(null);
+    const d = DEFAULT_NODES[id];
+    if (!d) return;
+    const parts = splitUrl(d.url);
+    setHost(parts.host);
+    setPort(parts.port);
+    setSecure(parts.secure);
+  }
 
   const cleanHost = host.trim();
   const cleanPort = (port.trim() || DEFAULT_PORT).replace(/[^0-9]/g, "");
@@ -143,10 +155,10 @@ export function NodeSettingsModal({
         <select
           className="input mb-4"
           value={networkId}
-          onChange={(e) => setNetworkId(e.target.value)}
+          onChange={(e) => selectNetwork(e.target.value)}
         >
           <option value="mainnet">mainnet</option>
-          <option value="testnet-11">testnet-11</option>
+          <option value="testnet-10">testnet-10</option>
           <option value="simnet">simnet</option>
         </select>
 
