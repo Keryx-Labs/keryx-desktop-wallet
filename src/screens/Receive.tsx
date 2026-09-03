@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import QRCode from "qrcode";
 import { wallet } from "../lib/wallet";
 import { useWalletState } from "../lib/useWallet";
+import { Modal } from "../components/Modal";
+import { palette } from "../lib/theme";
 
 export function Receive({ onClose }: { onClose: () => void }) {
   const w = useWalletState();
@@ -15,7 +17,7 @@ export function Receive({ onClose }: { onClose: () => void }) {
       QRCode.toCanvas(canvasRef.current, w.receiveAddress, {
         width: 208,
         margin: 1,
-        color: { dark: "#4ade80", light: "#0a0f0d" },
+        color: { dark: palette.green, light: palette.bg },
       }).catch(() => {});
     }
   }, [w.receiveAddress]);
@@ -40,15 +42,8 @@ export function Receive({ onClose }: { onClose: () => void }) {
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div className="panel flex w-full max-w-md flex-col items-center">
-        <div className="mb-4 flex w-full items-center justify-between">
-          <h2 className="text-lg font-bold text-keryx-green">Receive KRX</h2>
-          <button className="btn-ghost px-3 py-1.5 text-xs" onClick={onClose}>
-            Close
-          </button>
-        </div>
-
+    <Modal title="Receive KRX" onClose={onClose}>
+      <div className="flex flex-col items-center">
         {w.receiveAddress ? (
           <>
             {w.receiveAddresses.length > 1 && (
@@ -68,17 +63,17 @@ export function Receive({ onClose }: { onClose: () => void }) {
                             /* ignore */
                           }
                         }}
-                        className={`flex items-center justify-between gap-2 rounded-lg border px-3 py-2 text-left text-xs transition-colors ${
+                        className={`flex items-center justify-between gap-2 rounded-sm border px-3 py-2 text-left text-xs transition-colors ${
                           active
-                            ? "border-keryx-green/60 bg-keryx-green/10 text-keryx-green"
-                            : "border-keryx-border bg-black/20 text-emerald-100/80 hover:border-keryx-green/40"
+                            ? "border-keryx-green bg-keryx-green/10 text-keryx-bright"
+                            : "border-keryx-border bg-keryx-green/[0.03] text-keryx-text hover:border-keryx-borderHi"
                         }`}
                       >
                         <span>
                           Address {i + 1}
                           {active && <span className="ml-1.5 text-[10px]">✓</span>}
                         </span>
-                        <span className="font-mono text-[11px] text-emerald-200/50">
+                        <span className="num text-[11px] text-keryx-dim">
                           {a.slice(0, 10)}…{a.slice(-6)}
                         </span>
                       </button>
@@ -90,9 +85,9 @@ export function Receive({ onClose }: { onClose: () => void }) {
 
             <canvas
               ref={canvasRef}
-              className="rounded-xl border border-keryx-border"
+              className="rounded-sm border border-keryx-border"
             />
-            <code className="mt-4 block w-full break-all rounded-lg bg-black/30 p-3 text-center text-xs text-keryx-green/80">
+            <code className="mt-4 block w-full break-all rounded-sm border border-keryx-border bg-keryx-green/[0.03] p-3 text-center text-xs text-keryx-green">
               {w.receiveAddress}
             </code>
             <div className="mt-4 flex w-full gap-2">
@@ -117,17 +112,17 @@ export function Receive({ onClose }: { onClose: () => void }) {
               </button>
             </div>
             {!w.canAddReceiveAddress && (
-              <p className="mt-2 w-full text-center text-xs text-emerald-200/40">
+              <p className="mt-2 w-full text-center text-xs text-keryx-dim">
                 This wallet keeps up to 3 addresses. Switch between them above.
               </p>
             )}
           </>
         ) : (
-          <p className="py-12 text-sm text-emerald-200/40">No address yet.</p>
+          <p className="py-12 text-sm text-keryx-dim">No address yet.</p>
         )}
 
-        {err && <p className="mt-3 text-sm text-red-400">{err}</p>}
+        {err && <p className="mt-3 text-sm text-keryx-error">{err}</p>}
       </div>
-    </div>
+    </Modal>
   );
 }

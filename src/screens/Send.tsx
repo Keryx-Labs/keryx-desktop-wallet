@@ -1,8 +1,22 @@
 import { useState } from "react";
-import { wallet, formatKrx, SendEstimate } from "../lib/wallet";
+import {
+  wallet,
+  formatKrx,
+  groupKrx,
+  normalizeAmountInput,
+  SendEstimate,
+} from "../lib/wallet";
 import { useWalletState } from "../lib/useWallet";
+import { Modal } from "../components/Modal";
 
 type Step = "form" | "confirm" | "sending" | "done";
+
+/**
+ * Held back by "send max" so the node still has room to charge the network fee. The real fee
+ * comes from wallet.estimate() and is far smaller than this; 0.3 KRX is a deliberately
+ * generous cushion so a max-send is never rejected for being a few sompi short.
+ */
+const MAX_SEND_FEE_RESERVE = 30_000_000n; // 0.3 KRX, in sompi
 
 export function Send({ onClose }: { onClose: () => void }) {
   const w = useWalletState();
@@ -29,8 +43,23 @@ export function Send({ onClose }: { onClose: () => void }) {
   function parseAmounts():
     | { amountSompi: bigint; priorityFeeSompi: bigint }
     | null {
+    const parsedAmount = normalizeAmountInput(amount);
+    if ("error" in parsedAmount) {
+      setErr(parsedAmount.error);
+      return null;
+    }
+    let normalizedFee: string | null = null;
+    if (fee.trim()) {
+      const parsedFee = normalizeAmountInput(fee);
+      if ("error" in parsedFee) {
+        setErr(parsedFee.error);
+        return null;
+      }
+      normalizedFee = parsedFee.value;
+    }
     try {
-      const amountSompi = wallet.kaspaToSompi(amount);
+      // Always the normalized string — the node takes a plain decimal, never our display form.
+      const amountSompi = wallet.kaspaToSompi(parsedAmount.value);
       if (amountSompi <= 0n) {
         setErr("Amount must be greater than 0.");
         return null;
@@ -39,8 +68,8 @@ export function Send({ onClose }: { onClose: () => void }) {
         setErr("Amount exceeds your available (mature) balance.");
         return null;
       }
-      const priorityFeeSompi = fee.trim()
-        ? wallet.kaspaToSompi(fee)
+      const priorityFeeSompi = normalizedFee
+        ? wallet.kaspaToSompi(normalizedFee)
         : 0n;
       if (priorityFeeSompi < 0n) {
         setErr("Priority fee cannot be negative.");
@@ -155,167 +184,218 @@ export function Send({ onClose }: { onClose: () => void }) {
 
   const canSubmit = w.conn === "connected" && w.synced;
 
+  // The most that can go out in one send: the mature balance minus the fee cushion. Clamped at
+  // zero so a dust balance doesn't offer a negative "max".
+  const maxSendable =
+    w.balance.mature > MAX_SEND_FEE_RESERVE
+      ? w.balance.mature - MAX_SEND_FEE_RESERVE
+      : 0n;
+
+  function fillMax() {
+    setAmount(groupKrx(formatKrx(maxSendable)));
+    setErr(null);
+  }
+
+  // Echo how the field will actually be read, so a mistyped separator is caught before the
+  // estimate step rather than at the confirm screen.
+  const amountEcho = (() => {
+    if (!amount.trim()) return null;
+    const n = normalizeAmountInput(amount);
+    if ("error" in n) return { error: n.error };
+    try {
+      const shown = groupKrx(formatKrx(wallet.kaspaToSompi(n.value)));
+      // Always show a decimal place: "1,234" is read as one thousand two hundred thirty-four
+      // here, and echoing it as "1,234.0" makes that unmistakable to anyone who meant 1.234.
+      return { text: shown.includes(".") ? shown : `${shown}.0` };
+    } catch {
+      return { error: "Invalid amount." };
+    }
+  })();
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div className="panel w-full max-w-md">
-        <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-lg font-bold text-keryx-green">Send KRX</h2>
-          <button className="btn-ghost px-3 py-1.5 text-xs" onClick={onClose}>
-            Close
-          </button>
-        </div>
+    <Modal title="Send KRX" onClose={onClose}>
+      {!canSubmit && step === "form" && (
+        <p className="mb-4 rounded-sm border border-keryx-warn/40 bg-keryx-warn/10 p-2.5 text-xs leading-relaxed text-keryx-warn">
+          {w.conn !== "connected"
+            ? "Not connected to a node."
+            : "Node is still syncing. Sending is disabled until it catches up."}
+        </p>
+      )}
 
-        {!canSubmit && step === "form" && (
-          <p className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5 text-xs text-amber-300">
-            {w.conn !== "connected"
-              ? "Not connected to a node."
-              : "Node is still syncing. Sending is disabled until it catches up."}
-          </p>
-        )}
-
-        {step === "form" && (
-          <>
-            <label className="label">Destination address</label>
-            <input
-              className="input mb-1 font-mono"
-              value={dest}
-              onChange={(e) => setDest(e.target.value)}
-              placeholder={`${w.addressPrefix ?? "keryx"}:…`}
-              autoFocus
-            />
-            {dest.trim() && (
-              <p
-                className={`mb-3 text-xs ${
-                  wallet.validateAddress(dest)
-                    ? "text-keryx-green/70"
-                    : "text-red-400"
-                }`}
-              >
-                {wallet.validateAddress(dest)
-                  ? "Valid address ✓"
-                  : "Invalid address for the active network."}
-              </p>
-            )}
-
-            <label className="label mt-2">Amount (KRX)</label>
-            <input
-              className="input mb-1 font-mono"
-              value={amount}
-              onChange={(e) => setAmount(e.target.value)}
-              inputMode="decimal"
-              placeholder="0.0"
-            />
-            <p className="mb-3 text-xs text-emerald-200/40">
-              Available: {formatKrx(w.balance.mature)} KRX
-            </p>
-
-            <label className="label mt-2">Priority fee (KRX, optional)</label>
-            <input
-              className="input mb-5 font-mono"
-              value={fee}
-              onChange={(e) => setFee(e.target.value)}
-              inputMode="decimal"
-              placeholder="0.0"
-            />
-
-            {err && <p className="mb-3 text-sm text-red-400">{err}</p>}
-
-            <button
-              className="btn-primary w-full"
-              onClick={onEstimate}
-              disabled={estimating || !canSubmit}
+      {step === "form" && (
+        <>
+          <label className="label">Destination address</label>
+          <input
+            className="input mb-1"
+            value={dest}
+            onChange={(e) => setDest(e.target.value)}
+            placeholder={`${w.addressPrefix ?? "keryx"}:…`}
+            autoFocus
+          />
+          {dest.trim() && (
+            <p
+              className={`mb-3 text-xs ${
+                wallet.validateAddress(dest)
+                  ? "text-keryx-green"
+                  : "text-keryx-error"
+              }`}
             >
-              {estimating ? "Estimating…" : "Estimate fee"}
-            </button>
-          </>
-        )}
-
-        {(step === "confirm" || step === "sending") && estimate && frozen && (
-          <>
-            <div className="mb-4 space-y-3 rounded-xl border border-keryx-border bg-black/20 p-4">
-              <Row label="To">
-                <code className="break-all text-xs text-keryx-green/80">
-                  {frozen.dest}
-                </code>
-              </Row>
-              <Row label="Amount">
-                <span className="font-semibold text-keryx-green">
-                  {formatKrx(frozen.amountSompi)} KRX
-                </span>
-              </Row>
-              <Row label="Network fee (est.)">
-                <span className="text-emerald-100/80">
-                  {formatKrx(estimate.feeSompi)} KRX
-                </span>
-              </Row>
-              <Row label="Total (est.)">
-                <span className="font-semibold text-keryx-green">
-                  {formatKrx(estimate.totalSompi)} KRX
-                </span>
-              </Row>
-            </div>
-
-            <label className="label">Confirm with your password</label>
-            <input
-              className="input mb-4"
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="Wallet password"
-              autoComplete="current-password"
-              disabled={step === "sending"}
-              autoFocus
-            />
-
-            {err && <p className="mb-3 text-sm text-red-400">{err}</p>}
-
-            <div className="flex gap-2">
-              <button
-                className="btn-ghost flex-1"
-                onClick={() => {
-                  setStep("form");
-                  setErr(null);
-                }}
-                disabled={step === "sending"}
-              >
-                Back
-              </button>
-              <button
-                className="btn-primary flex-1"
-                onClick={onConfirm}
-                disabled={step === "sending"}
-              >
-                {step === "sending" ? "Sending…" : "Confirm & send"}
-              </button>
-            </div>
-          </>
-        )}
-
-        {step === "done" && (
-          <div className="text-center">
-            <p className="mb-3 text-lg font-bold text-keryx-green">Sent ✓</p>
-            <p className="mb-3 text-sm text-emerald-100/70">
-              {txids.length === 1
-                ? "Transaction submitted:"
-                : `${txids.length} transactions submitted:`}
+              {wallet.validateAddress(dest)
+                ? "Valid address ✓"
+                : "Invalid address for the active network."}
             </p>
-            <div className="mb-5 space-y-1">
-              {txids.map((id) => (
-                <code
-                  key={id}
-                  className="block break-all rounded-lg bg-black/30 p-2 text-xs text-keryx-green/80"
-                >
-                  {id}
-                </code>
-              ))}
-            </div>
-            <button className="btn-primary w-full" onClick={onClose}>
-              Done
+          )}
+
+          <label className="label mt-2">Amount (KRX)</label>
+          <input
+            className="input mb-1"
+            value={amount}
+            onChange={(e) => setAmount(e.target.value)}
+            inputMode="decimal"
+            placeholder="0.0"
+          />
+          {amountEcho && (
+            <p
+              className={`num mb-1 text-xs ${
+                "error" in amountEcho ? "text-keryx-error" : "text-keryx-mid"
+              }`}
+            >
+              {"error" in amountEcho
+                ? amountEcho.error
+                : `= ${amountEcho.text} KRX`}
+            </p>
+          )}
+          <p className="mb-3 text-xs text-keryx-dim">
+            {maxSendable > 0n ? (
+              <button
+                type="button"
+                className="num text-keryx-green underline decoration-dotted underline-offset-2 transition-colors hover:text-keryx-bright"
+                onClick={fillMax}
+                title={`Fill in ${formatKrx(maxSendable)} KRX — everything except 0.3 KRX kept back for the network fee`}
+              >
+                Available: {groupKrx(formatKrx(w.balance.mature))} KRX
+              </button>
+            ) : (
+              <span className="num">
+                Available: {groupKrx(formatKrx(w.balance.mature))} KRX
+              </span>
+            )}
+            {maxSendable > 0n && (
+              <span className="text-keryx-dim">
+                {" "}
+                · click to send max (keeps 0.3 KRX for fees)
+              </span>
+            )}
+          </p>
+
+          <label className="label mt-2">Priority fee (KRX, optional)</label>
+          <input
+            className="input mb-5"
+            value={fee}
+            onChange={(e) => setFee(e.target.value)}
+            inputMode="decimal"
+            placeholder="0.0"
+          />
+
+          {err && <p className="mb-3 text-sm text-keryx-error">{err}</p>}
+
+          <button
+            className="btn-primary w-full"
+            onClick={onEstimate}
+            disabled={estimating || !canSubmit}
+          >
+            {estimating ? "Estimating…" : "Estimate fee"}
+          </button>
+        </>
+      )}
+
+      {(step === "confirm" || step === "sending") && estimate && frozen && (
+        <>
+          <div className="card mb-4 space-y-3 p-4">
+            <Row label="To">
+              <code className="break-all text-xs text-keryx-green">
+                {frozen.dest}
+              </code>
+            </Row>
+            <Row label="Amount">
+              <span className="num font-semibold text-keryx-bright">
+                {formatKrx(frozen.amountSompi)} KRX
+              </span>
+            </Row>
+            <Row label="Network fee (est.)">
+              <span className="num text-keryx-ink">
+                {formatKrx(estimate.feeSompi)} KRX
+              </span>
+            </Row>
+            <Row label="Total (est.)">
+              <span className="num font-semibold text-keryx-bright">
+                {formatKrx(estimate.totalSompi)} KRX
+              </span>
+            </Row>
+          </div>
+
+          <label className="label">Confirm with your password</label>
+          <input
+            className="input mb-4"
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder="Wallet password"
+            autoComplete="current-password"
+            disabled={step === "sending"}
+            autoFocus
+          />
+
+          {err && <p className="mb-3 text-sm text-keryx-error">{err}</p>}
+
+          <div className="flex gap-2">
+            <button
+              className="btn-ghost flex-1"
+              onClick={() => {
+                setStep("form");
+                setErr(null);
+              }}
+              disabled={step === "sending"}
+            >
+              Back
+            </button>
+            <button
+              className="btn-primary flex-1"
+              onClick={onConfirm}
+              disabled={step === "sending"}
+            >
+              {step === "sending" ? "Sending…" : "Confirm & send"}
             </button>
           </div>
-        )}
-      </div>
-    </div>
+        </>
+      )}
+
+      {step === "done" && (
+        <div className="text-center">
+          <p className="glow mb-3 text-sm font-bold uppercase tracking-label text-keryx-bright">
+            Sent ✓
+          </p>
+          <p className="mb-3 text-sm leading-relaxed text-keryx-text">
+            {txids.length === 1
+              ? "Transaction submitted:"
+              : `${txids.length} transactions submitted:`}
+          </p>
+          <div className="mb-5 space-y-1">
+            {txids.map((id) => (
+              <code
+                key={id}
+                className="block break-all rounded-sm border border-keryx-border bg-keryx-green/[0.03] p-2 text-xs text-keryx-green"
+              >
+                {id}
+              </code>
+            ))}
+          </div>
+          <button className="btn-primary w-full" onClick={onClose}>
+            Done
+          </button>
+        </div>
+      )}
+    </Modal>
   );
 }
 
@@ -328,7 +408,7 @@ function Row({
 }) {
   return (
     <div className="flex items-start justify-between gap-3">
-      <span className="text-xs uppercase tracking-wide text-emerald-200/50">
+      <span className="text-[10px] uppercase tracking-label text-keryx-dim">
         {label}
       </span>
       <span className="text-right">{children}</span>

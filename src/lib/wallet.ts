@@ -22,6 +22,43 @@ const RECEIVED_LOG_KEY = "keryx.wallet.received.v1";
 const RECEIVE_LIST_KEY = "keryx.wallet.receivelist.v1";
 const RECEIVE_ACTIVE_KEY = "keryx.wallet.receiveactive.v1";
 
+/*
+ * MULTI-WALLET STORAGE
+ *
+ * Each "wallet" the user sees is its own seed (one prvKeyData) with its own bip32 account, and all
+ * of them live inside the SAME SDK wallet file. That is deliberate: one file means ONE
+ * walletSecret, so the password is shared by construction and walletChangeSecret rotates every
+ * wallet at once. Verified against this SDK build — two prvKeyData in one file yield two accounts
+ * with distinct addresses, accountsRename works, and after a rotation the old password is rejected
+ * for all of them. Separate wallet files would each carry their own password, which is exactly what
+ * we do not want.
+ *
+ * SEED_BLOB_KEY (single blob) is the pre-multi-wallet layout and is migrated into SEED_BLOBS_KEY on
+ * the first open. It is deliberately NOT deleted, so an older build still opens the same wallet.
+ */
+const SEED_BLOBS_KEY = "keryx.wallet.seeds.v1"; // { [prvKeyDataId]: encrypted mnemonic }
+/** Local alias overrides, so renaming costs no password. The SDK's accountName is set at creation
+ *  and remains the fallback — it is what survives a wallet-file export/restore. */
+const ALIASES_KEY = "keryx.wallet.aliases.v1"; // { [accountId]: alias }
+/**
+ * accountIds the user removed from THIS APP'S list. Local and reversible by design: the wallet
+ * file, the account and its recovery phrase are all left untouched, so a hidden wallet keeps
+ * mining, keeps its balance, and comes back intact when restored. Nothing here reaches the
+ * network — coins live on the chain, not in this list.
+ */
+const HIDDEN_WALLETS_KEY = "keryx.wallet.hidden.v1"; // accountId[]
+const ACTIVE_WALLET_KEY = "keryx.wallet.activewallet.v1"; // accountId
+/** Receive-address switcher, keyed BY ACCOUNT. The v1 keys were a flat list from when there was one
+ *  seed; sharing them across wallets would offer an address derived from another seed, which the
+ *  active account cannot sign for. Migrated on first open. */
+const RECEIVE_LIST_BY_ACCOUNT_KEY = "keryx.wallet.receivelist.v2";
+const RECEIVE_ACTIVE_BY_ACCOUNT_KEY = "keryx.wallet.receiveactive.v2";
+/** Receive+change depth scanned per wallet when summing the all-wallets total. */
+const TOTALS_DEPTH = 20;
+/** How many of an account's addresses to test for mining production before giving up. Payout
+ *  addresses sit at low derivation indexes in practice; this only runs until one is found. */
+const HOLDER_REWARD_SCAN_LIMIT = 40;
+
 export interface NodeSettings {
   url: string;
   networkId: string;
@@ -31,6 +68,19 @@ export const DEFAULT_NODE: NodeSettings = {
   url: "ws://127.0.0.1:23110",
   networkId: "mainnet",
 };
+
+/** One user-visible wallet: its own recovery phrase, its own account, its own addresses. */
+export interface WalletEntry {
+  accountId: string;
+  prvKeyDataId: string | null;
+  alias: string;
+  receiveAddress: string | null;
+  /** We hold a password-encrypted copy of this wallet's phrase, so it can be revealed/backed up. */
+  hasSeed: boolean;
+  /** Mature sompi from the last totals refresh; null until one has run. For the ACTIVE wallet the
+   *  live `balance.mature` is authoritative instead — see totalBalanceSompi. */
+  balanceSompi: bigint | null;
+}
 
 export interface WalletBalance {
   mature: bigint;
@@ -129,6 +179,10 @@ type Listener = () => void;
 class WalletService {
   private wallet: kaspa.Wallet | null = null;
   private wasmReady = false;
+  /** In-flight init(), so concurrent callers share one WASM instantiation. See init(). */
+  private initPromise: Promise<void> | null = null;
+  /** Endpoint the current `wallet` was built for, so setNode can skip a pointless rebuild. */
+  private walletEndpoint: string | null = null;
   private _accountId: string | null = null;
   private _networkId: string = DEFAULT_NODE.networkId;
 
@@ -147,6 +201,27 @@ class WalletService {
   /** Public-key generator cached at open() (no private keys) so "My addresses" can derive + scan the
    *  wallet's addresses WITHOUT asking for the password again. Dropped on lock. */
   private pubGen: kaspa.PublicKeyGenerator | null = null;
+  /** Every wallet in the file, in creation order. Empty while locked. */
+  wallets: WalletEntry[] = [];
+  /** Latched once a node answers `getHolderReward` with "no such method" — see `holderReward`. */
+  private holderRewardUnsupported = false;
+  /** Same latch for `getServiceStrikes`, so an old node is asked once, not every poll. */
+  private serviceStrikesUnsupported = false;
+  /** The account address found to be mining, so the sweep runs once — see `holderReward`. */
+  private holderRewardAddress: string | null = null;
+  /** Per-wallet public-key generators, derived at open() from each stored phrase. Memory only. */
+  private pubGens = new Map<string, kaspa.PublicKeyGenerator>();
+  /**
+   * Account descriptors by accountId, cached when the registry is built.
+   *
+   * Switching wallets used to re-read them with accountsEnumerate, which shares the SDK's single
+   * WASM thread with the UTXO scan and so could sit behind it for more than ten seconds — the
+   * "timeout after 10000ms (accountsEnumerate-select)" a switch could fail with. open() has
+   * already fetched every descriptor, so a switch reads them from here and touches no RPC.
+   */
+  private descriptorCache = new Map<string, any>();
+  /** accountId of a wallet switch in flight, so the UI can show it instead of stale zeros. */
+  switchingWallet: string | null = null;
   /** Live consolidation state, or null if none has run this session. Kept here rather than in the
    *  modal so the run survives closing it and reopening shows the real state. */
   consolidateRun: ConsolidateRun | null = null;
@@ -187,10 +262,57 @@ class WalletService {
   get networkId(): string {
     return this._networkId;
   }
+  /** How many wallets (separate recovery phrases) this file holds. */
+  get walletCount(): number {
+    return this.wallets.length;
+  }
+  /** The wallet whose account is currently active, or null when locked. */
+  get activeWallet(): WalletEntry | null {
+    return this.wallets.find((w) => w.accountId === this._accountId) ?? null;
+  }
+  /**
+   * Mature balance across every wallet. The active wallet contributes its LIVE balance (the same
+   * number the dashboard shows) rather than its last polled one, so the total can never disagree
+   * with the headline figure; the others contribute their last totals refresh.
+   */
+  get totalBalanceSompi(): bigint {
+    let total = 0n;
+    for (const e of this.wallets) {
+      // Mid-switch the active wallet's live balance is still 0 (not read yet), so fall back to its
+      // last poll — otherwise the total visibly dips every time you change wallet.
+      const useLive = e.accountId === this._accountId && this.switchingWallet === null;
+      total += useLive ? this.balance.mature : (e.balanceSompi ?? 0n);
+    }
+    return total;
+  }
 
-  /** Load WASM and verify (at runtime) the real Keryx address prefix. */
-  async init(): Promise<void> {
-    if (this.wasmReady) return;
+  /**
+   * Load WASM and verify (at runtime) the real Keryx address prefix.
+   *
+   * Concurrency-safe on purpose. `wasmReady` is only set at the END of the work, so two
+   * overlapping calls both used to get past the guard — and wasm-bindgen's own
+   * `if (wasm !== undefined) return wasm` guard is likewise only armed after instantiation
+   * resolves, so both proceeded to instantiate the module. That left TWO WebAssembly
+   * instances with separate linear memories while the glue's module-level binding pointed at
+   * whichever finished last: every handle created against the first instance (the Wallet, keys)
+   * became a dangling pointer into the wrong memory. It surfaced as wallet-store calls hanging
+   * forever and "RuntimeError: memory access out of bounds", i.e. wallet creation never
+   * finishing. React StrictMode double-invokes effects in dev, which is exactly how the app hit
+   * it; a remount can do the same in production. Sharing the in-flight promise makes the second
+   * caller await the first instantiation instead of starting another.
+   */
+  init(): Promise<void> {
+    if (this.wasmReady) return Promise.resolve();
+    if (!this.initPromise) {
+      this.initPromise = this.loadWasm().catch((e) => {
+        this.initPromise = null; // let a later attempt retry rather than latch the failure
+        throw e;
+      });
+    }
+    return this.initPromise;
+  }
+
+  private async loadWasm(): Promise<void> {
     await kaspa.default(wasmUrl);
     // Runtime prefix verification (the .d.ts shows upstream "kaspa:" but the
     // Keryx build emits a different prefix). Derive a throwaway address.
@@ -234,12 +356,18 @@ class WalletService {
   }
 
   /**
-   * Step 2 of creation: persist the wallet, store the private key data from the
-   * (backed-up) mnemonic and create the first account, then open it.
+   * Step 2 of creation: persist the wallet file, store the private key data from the (backed-up)
+   * mnemonic, create its account and open it. This is the FIRST wallet — its password becomes the
+   * file's walletSecret, which every wallet added later then shares.
    */
-  async finishCreate(password: string, mnemonicPhrase: string): Promise<void> {
+  async finishCreate(
+    password: string,
+    mnemonicPhrase: string,
+    alias?: string
+  ): Promise<void> {
     this.ensureWallet();
     const w = this.wallet!;
+    const name = WalletService.cleanAlias(alias, 1);
     await w.walletCreate({
       walletSecret: password,
       filename: WALLET_FILENAME,
@@ -249,26 +377,32 @@ class WalletService {
       walletSecret: password,
       kind: "mnemonic",
       mnemonic: mnemonicPhrase,
+      name,
     });
     await w.accountsCreate({
       walletSecret: password,
       type: "bip32",
-      accountName: "Account 1",
+      accountName: name,
       prvKeyDataId: pk.prvKeyDataId,
     });
-    this.storeSeedBackup(mnemonicPhrase, password);
+    this.storeSeedBackup(String(pk.prvKeyDataId), mnemonicPhrase, password);
     this.clearLocalActivity(); // fresh wallet → don't inherit a previous seed's activity
     await this.open(password);
   }
 
-  /** Import an existing 12/24-word mnemonic into a fresh wallet, then open it. */
-  async importMnemonic(password: string, phrase: string): Promise<void> {
+  /** Import an existing 12/24-word mnemonic as the FIRST wallet in a fresh file, then open it. */
+  async importMnemonic(
+    password: string,
+    phrase: string,
+    alias?: string
+  ): Promise<void> {
     const clean = phrase.trim().replace(/\s+/g, " ");
     if (!kaspa.Mnemonic.validate(clean)) {
       throw new Error("Invalid recovery phrase.");
     }
     this.ensureWallet();
     const w = this.wallet!;
+    const name = WalletService.cleanAlias(alias, 1);
     await w.walletCreate({
       walletSecret: password,
       filename: WALLET_FILENAME,
@@ -278,45 +412,309 @@ class WalletService {
       walletSecret: password,
       kind: "mnemonic",
       mnemonic: clean,
+      name,
     });
     await w.accountsCreate({
       walletSecret: password,
       type: "bip32",
-      accountName: "Account 1",
+      accountName: name,
       prvKeyDataId: pk.prvKeyDataId,
     });
-    this.storeSeedBackup(clean, password);
+    this.storeSeedBackup(String(pk.prvKeyDataId), clean, password);
     this.clearLocalActivity(); // imported wallet → start its activity log clean
     await this.open(password);
   }
 
-  /** True if a recovery phrase is available to reveal for the current wallet. */
-  hasSeedBackup(): boolean {
+  /**
+   * Add ANOTHER wallet (its own recovery phrase) to the already-open file, and make it active.
+   *
+   * The password is required again because we deliberately never keep it in memory — and it is the
+   * file's single walletSecret, so this is the same password every other wallet uses. Deliberately
+   * does NOT clear the local activity log: that log is shared by every wallet in the file, keyed by
+   * address, and wiping it here would erase the other wallets' history.
+   */
+  async addWallet(
+    password: string,
+    phrase: string,
+    alias?: string
+  ): Promise<string> {
+    if (!this.isOpen) throw new Error("Unlock the wallet first.");
+    const w = this.wallet!;
+    const clean = phrase.trim().replace(/\s+/g, " ");
+    if (!kaspa.Mnemonic.validate(clean)) {
+      throw new Error("Invalid recovery phrase.");
+    }
+    // Two accounts on the same phrase would show the same coins twice and double the total, so
+    // refuse a phrase already in the file. Compared by the index-0 address it derives to, which is
+    // cheap and local.
+    const existing = this.firstAddressOf(clean);
+    if (existing) {
+      const dup = this.wallets.find((e) => e.receiveAddress === existing);
+      if (dup) {
+        throw new Error(`That phrase is already in this wallet, as "${dup.alias}".`);
+      }
+    }
+    const name = WalletService.cleanAlias(alias, this.wallets.length + 1);
+    let pk;
     try {
-      return !!localStorage.getItem(SEED_BLOB_KEY);
+      pk = await w.prvKeyDataCreate({
+        walletSecret: password,
+        kind: "mnemonic",
+        mnemonic: clean,
+        name,
+      });
     } catch {
-      return false;
+      throw new Error("Could not add the wallet (wrong password?).");
+    }
+    const created = await w.accountsCreate({
+      walletSecret: password,
+      type: "bip32",
+      accountName: name,
+      prvKeyDataId: pk.prvKeyDataId,
+    });
+    this.storeSeedBackup(String(pk.prvKeyDataId), clean, password);
+    const accountId = WalletService.accountIdOf(created);
+    await this.refreshRegistry(password);
+    if (accountId) await this.selectWallet(accountId);
+    this.emit();
+    return accountId ?? "";
+  }
+
+  /** The index-0 receive address a phrase derives to on the active network, or null. */
+  private firstAddressOf(phrase: string): string | null {
+    try {
+      const seed = new kaspa.Mnemonic(phrase).toSeed();
+      const gen = kaspa.PublicKeyGenerator.fromMasterXPrv(
+        new kaspa.XPrv(seed).toString(),
+        false,
+        0n
+      );
+      return gen.receiveAddressAsStrings(this._networkId, 0, 1)[0] ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private static accountIdOf(created: unknown): string | null {
+    const c = created as { accountDescriptor?: { accountId?: unknown }; accountId?: unknown };
+    const id = c?.accountDescriptor?.accountId ?? c?.accountId;
+    return id ? String(id) : null;
+  }
+
+  private static cleanAlias(alias: string | undefined, index: number): string {
+    const trimmed = (alias ?? "").trim().replace(/\s+/g, " ").slice(0, 40);
+    return trimmed || `Wallet ${index}`;
+  }
+
+  /** Rename a wallet. Local-only, so it costs no password — see ALIASES_KEY. */
+  renameWallet(accountId: string, alias: string): void {
+    const entry = this.wallets.find((e) => e.accountId === accountId);
+    if (!entry) throw new Error("Unknown wallet.");
+    const name = WalletService.cleanAlias(
+      alias,
+      this.wallets.indexOf(entry) + 1
+    );
+    entry.alias = name;
+    try {
+      const map = this.readAliases();
+      map[accountId] = name;
+      localStorage.setItem(ALIASES_KEY, JSON.stringify(map));
+    } catch {
+      /* non-fatal: the SDK accountName remains as the fallback */
+    }
+    this.emit();
+  }
+
+  /** accountIds of every wallet hidden from this app's list, in on-disk order. */
+  get hiddenWalletIds(): string[] {
+    return [...this.readHiddenWallets()];
+  }
+
+  /**
+   * Remove a wallet from this app's list. LOCAL AND REVERSIBLE: the wallet file, the account and
+   * its recovery phrase are untouched, so nothing is destroyed and nothing changes on the chain —
+   * the address keeps its balance and keeps mining. `restoreWallet` brings it back.
+   *
+   * Two refusals, both to avoid a state with no way out: the active wallet (switch first, so the
+   * app is never left pointing at a wallet it no longer lists) and the last visible one (hiding it
+   * would leave an open wallet file with an empty switcher).
+   */
+  hideWallet(accountId: string): void {
+    const entry = this.wallets.find((e) => e.accountId === accountId);
+    if (!entry) throw new Error("Unknown wallet.");
+    if (accountId === this._accountId) {
+      throw new Error("This is the active wallet. Switch to another one first, then remove it.");
+    }
+    if (this.wallets.length <= 1) {
+      throw new Error("This is your only wallet. Add another one before removing this one.");
+    }
+    const hidden = this.readHiddenWallets();
+    hidden.add(accountId);
+    this.writeHiddenWallets(hidden);
+    this.wallets = this.wallets.filter((e) => e.accountId !== accountId);
+    this.emit();
+  }
+
+  /** Put a hidden wallet back in the list. Rebuilds from the cached descriptor — no RPC, no
+   *  password: nothing was ever removed, so there is nothing to recover. */
+  restoreWallet(accountId: string): void {
+    const hidden = this.readHiddenWallets();
+    if (!hidden.delete(accountId)) return;
+    this.writeHiddenWallets(hidden);
+    const descriptors = [...this.descriptorCache.values()];
+    if (descriptors.length) this.wallets = this.buildRegistry(descriptors);
+    this.emit();
+  }
+
+  /**
+   * Display label for a hidden wallet: its local alias, else its receive address, else the raw
+   * accountId. Read from the descriptor cache, which deliberately keeps hidden accounts, so a
+   * removed wallet is still recognisable in the restore list rather than an opaque id.
+   */
+  hiddenWalletLabel(accountId: string): string {
+    const alias = this.readAliases()[accountId];
+    if (alias) return alias;
+    const d = this.descriptorCache.get(accountId);
+    const name = typeof d?.accountName === "string" ? d.accountName : null;
+    if (name) return name;
+    const addr = d?.receiveAddress ? String(d.receiveAddress) : null;
+    return addr ?? accountId;
+  }
+
+  private readHiddenWallets(): Set<string> {
+    try {
+      const raw = localStorage.getItem(HIDDEN_WALLETS_KEY);
+      if (!raw) return new Set();
+      const parsed = JSON.parse(raw) as unknown;
+      return new Set(Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : []);
+    } catch {
+      // Unreadable ⇒ hide nothing. Erring towards showing a wallet is the safe direction: the
+      // opposite would make a wallet the user still has quietly disappear.
+      return new Set();
+    }
+  }
+
+  private writeHiddenWallets(ids: Set<string>): void {
+    try {
+      localStorage.setItem(HIDDEN_WALLETS_KEY, JSON.stringify([...ids]));
+    } catch {
+      /* non-fatal: the wallet reappears on the next open, which is the harmless direction */
+    }
+  }
+
+  private readAliases(): Record<string, string> {
+    try {
+      const raw = localStorage.getItem(ALIASES_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(parsed)) {
+        if (typeof v === "string") out[k] = v;
+      }
+      return out;
+    } catch {
+      return {};
+    }
+  }
+
+  // --- per-wallet seed backups -------------------------------------------------------------
+  // The SDK exposes no way to read a stored mnemonic back (IPrvKeyDataGetResponse is empty in this
+  // build), so we keep our own copy per seed, encrypted with the wallet password using the SDK's
+  // XChaCha20-Poly1305 — the same scheme the wallet file uses, so no new exposure. Keyed by
+  // prvKeyDataId because that is what identifies a seed; account ids are per-account.
+
+  private readSeedBlobs(): Record<string, string> {
+    try {
+      const raw = localStorage.getItem(SEED_BLOBS_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(parsed)) {
+        if (typeof v === "string") out[k] = v;
+      }
+      return out;
+    } catch {
+      return {};
+    }
+  }
+
+  private writeSeedBlobs(map: Record<string, string>): void {
+    try {
+      localStorage.setItem(SEED_BLOBS_KEY, JSON.stringify(map));
+    } catch {
+      /* non-fatal: reveal just won't be available */
+    }
+  }
+
+  /** Encrypt one wallet's mnemonic with the wallet password and persist it (for reveal/backup). */
+  private storeSeedBackup(
+    prvKeyDataId: string,
+    phrase: string,
+    password: string
+  ): void {
+    if (!prvKeyDataId) return;
+    try {
+      const map = this.readSeedBlobs();
+      map[prvKeyDataId] = kaspa.encryptXChaCha20Poly1305(phrase, password);
+      this.writeSeedBlobs(map);
+    } catch {
+      /* non-fatal */
     }
   }
 
   /**
-   * Reveal the recovery phrase. Decrypts our own password-encrypted copy; the correct password
-   * is required (a wrong one throws). The phrase is returned to the caller, never logged.
+   * Pull the pre-multi-wallet single blob into the keyed map, so an existing wallet keeps its
+   * "reveal phrase" after the upgrade. The legacy key is left in place on purpose: an older build
+   * of the app must still be able to open the same wallet.
    */
-  revealMnemonic(password: string): string {
-    const blob = (() => {
-      try {
-        return localStorage.getItem(SEED_BLOB_KEY);
-      } catch {
-        return null;
-      }
-    })();
+  private migrateLegacySeedBlob(prvKeyDataId: string | null): void {
+    if (!prvKeyDataId) return;
+    try {
+      const legacy = localStorage.getItem(SEED_BLOB_KEY);
+      if (!legacy) return;
+      const map = this.readSeedBlobs();
+      if (map[prvKeyDataId]) return; // already migrated
+      map[prvKeyDataId] = legacy;
+      this.writeSeedBlobs(map);
+    } catch {
+      /* non-fatal */
+    }
+  }
+
+  /** True if a recovery phrase is available to reveal for a wallet (default: the active one). */
+  hasSeedBackup(accountId?: string): boolean {
+    const id = this.prvKeyDataIdFor(accountId ?? this._accountId);
+    if (!id) return false;
+    return !!this.readSeedBlobs()[id];
+  }
+
+  private prvKeyDataIdFor(accountId: string | null): string | null {
+    if (!accountId) return null;
+    return (
+      this.wallets.find((w) => w.accountId === accountId)?.prvKeyDataId ?? null
+    );
+  }
+
+  /**
+   * Reveal a wallet's recovery phrase (default: the active wallet). Decrypts our own
+   * password-encrypted copy; the correct password is required (a wrong one throws). The phrase is
+   * returned to the caller, never logged.
+   */
+  revealMnemonic(password: string, accountId?: string): string {
+    const id = this.prvKeyDataIdFor(accountId ?? this._accountId);
+    const blob = id ? this.readSeedBlobs()[id] : undefined;
     if (!blob) {
       throw new Error("No recovery phrase is stored for this wallet.");
     }
-    // Decryption failing is the password being wrong; a successful decrypt that
-    // yields an invalid phrase means the stored blob is corrupted, not a bad
-    // password — report the two distinctly so the user is not misled.
+    return WalletService.decryptPhrase(blob, password);
+  }
+
+  /**
+   * Decrypt one stored phrase. Decryption failing is the password being wrong; a successful
+   * decrypt that yields an invalid phrase means the stored blob is corrupted, not a bad password —
+   * report the two distinctly so the user is not misled.
+   */
+  private static decryptPhrase(blob: string, password: string): string {
     let phrase: string;
     try {
       phrase = kaspa.decryptXChaCha20Poly1305(blob, password);
@@ -329,29 +727,22 @@ class WalletService {
     return phrase;
   }
 
-  /** Encrypt the mnemonic with the wallet password and persist it (for reveal/backup). */
-  private storeSeedBackup(phrase: string, password: string) {
-    try {
-      localStorage.setItem(
-        SEED_BLOB_KEY,
-        kaspa.encryptXChaCha20Poly1305(phrase, password)
-      );
-    } catch {
-      /* non-fatal: reveal just won't be available */
-    }
-  }
-
   /**
-   * Change the wallet password. Recovers the phrase with the OLD password first (which also
-   * verifies it), rotates the SDK wallet secret, then re-encrypts our own seed-backup copy with
-   * the NEW password so "reveal phrase" keeps working. Requires the wallet to be open.
+   * Change the password. One walletSecret covers every wallet in the file, so a single
+   * walletChangeSecret rotates all of them at once — there is no per-wallet password to keep in
+   * sync. Our own phrase copies are decrypted with the OLD password first (which also verifies it)
+   * and re-encrypted with the NEW one afterwards, so "reveal phrase" keeps working for every
+   * wallet. Requires the wallet to be open.
    */
   async changePassword(oldPassword: string, newPassword: string): Promise<void> {
     if (!this.isOpen) throw new Error("Open the wallet first.");
     const w = this.wallet!;
-    let phrase: string | null = null;
-    if (this.hasSeedBackup()) {
-      phrase = this.revealMnemonic(oldPassword); // throws "Wrong password." if wrong
+    // Decrypt everything BEFORE touching the wallet secret: if the old password is wrong we must
+    // fail without having rotated anything.
+    const blobs = this.readSeedBlobs();
+    const phrases: Record<string, string> = {};
+    for (const [id, blob] of Object.entries(blobs)) {
+      phrases[id] = WalletService.decryptPhrase(blob, oldPassword); // throws "Wrong password."
     }
     try {
       await w.walletChangeSecret({
@@ -361,7 +752,11 @@ class WalletService {
     } catch {
       throw new Error("Could not change password (wrong current password?).");
     }
-    if (phrase) this.storeSeedBackup(phrase, newPassword);
+    const next: Record<string, string> = {};
+    for (const [id, phrase] of Object.entries(phrases)) {
+      next[id] = kaspa.encryptXChaCha20Poly1305(phrase, newPassword);
+    }
+    if (Object.keys(next).length > 0) this.writeSeedBlobs(next);
   }
 
   /**
@@ -418,41 +813,292 @@ class WalletService {
       // Most common failure here is a wrong password.
       throw new Error("Could not unlock wallet (wrong password?).");
     }
-    const descriptors = opened.accountDescriptors ?? [];
+    const descriptors = (opened.accountDescriptors ?? []) as any[];
     if (descriptors.length === 0) {
       throw new Error("Wallet has no accounts.");
     }
-    const acc = descriptors[0];
-    this._accountId = acc.accountId;
-    this.receiveAddress = acc.receiveAddress
-      ? acc.receiveAddress.toString()
-      : null;
-    this.gotBalanceEvent = false;
-    this.accountAddresses = this.collectDescriptorAddresses(acc);
-    this.initReceiveList(); // restore the saved receive-address switcher list + active selection
-    // Cache the PUBLIC key generator (no private keys) so we can scan addresses later without the
-    // password. We have the password here; deriving the generator is local + fast. Non-fatal.
-    try {
-      const phrase = this.revealMnemonic(password);
-      const seed = new kaspa.Mnemonic(phrase).toSeed();
-      const xprv = new kaspa.XPrv(seed);
-      this.pubGen = kaspa.PublicKeyGenerator.fromMasterXPrv(
-        xprv.toString(),
-        false,
-        0n
-      );
-    } catch {
-      this.pubGen = null;
+    // Every account in the file is one wallet (one seed). A pre-multi-wallet file has exactly one,
+    // so this collapses to the old behaviour for it.
+    this.migrateLegacySeedBlob(WalletService.prvKeyIdOf(descriptors[0]));
+    this.wallets = this.buildRegistry(descriptors);
+    this.derivePubGens(password);
+    this.migrateLegacyReceiveList(String(descriptors[0].accountId));
+
+    const wanted = this.readActiveWalletId();
+    // Resolve the active account among the VISIBLE ones. Adopting a wallet the user removed from
+    // the list would leave the app pointing at a wallet its own switcher does not show — no way to
+    // switch away, and a balance on screen with no entry to match it. Reachable whenever the
+    // hidden list and the stored active id fall out of step (one key cleared, not the other).
+    const visible = this.wallets.map((e) => e.accountId);
+    const acc =
+      descriptors.find((d) => String(d.accountId) === wanted && visible.includes(String(d.accountId))) ??
+      descriptors.find((d) => visible.includes(String(d.accountId)));
+    if (acc) {
+      this.adoptAccount(acc);
+    } else {
+      // Every account in the file is hidden — a state the UI refuses to create, so it means the
+      // hidden list is stale. Showing a wallet the user still owns beats opening into an empty
+      // switcher, so drop the list and start over from the file.
+      this.writeHiddenWallets(new Set());
+      this.wallets = this.buildRegistry(descriptors);
+      this.adoptAccount(descriptors.find((d) => String(d.accountId) === wanted) ?? descriptors[0]);
     }
 
     // UNLOCK = walletOpen succeeded (the wallet is decrypted). That is LOCAL and fast. We must NOT
     // block the unlock on anything network-bound: connecting to the node, starting the processor,
     // and especially activating the account (which kicks off the UTXO scan and can be slow or
     // stall) all run in the BACKGROUND below. The UI shows the dashboard immediately and the
-    // connection/scan/balance fill in via the status bar — so "unlocking" can never hang.
+    // connection/scan/balance fill in via the status bar - so "unlocking" can never hang.
     this.conn = "connecting";
     this.emit();
-    void this.connectActivateScan(acc.accountId);
+    void this.connectActivateScan(this._accountId!);
+  }
+
+  // --- wallet registry ----------------------------------------------------------------------
+
+  /** Point local state at one account: its addresses, its switcher list, its key generator. */
+  private adoptAccount(acc: any): void {
+    this._accountId = String(acc.accountId);
+    this.receiveAddress = acc.receiveAddress ? acc.receiveAddress.toString() : null;
+    this.gotBalanceEvent = false;
+    // Belongs to the account we are leaving: keeping it would report the previous wallet's
+    // mining status under the new wallet's balance.
+    this.holderRewardAddress = null;
+    this.accountAddresses = this.collectDescriptorAddresses(acc);
+    // Each wallet needs ITS OWN generator: another seed's would derive addresses this account
+    // cannot sign for.
+    this.pubGen = this.pubGens.get(this._accountId) ?? null;
+    this.initReceiveList();
+    this.writeActiveWalletId(this._accountId);
+  }
+
+  private static prvKeyIdOf(d: any): string | null {
+    const ids = d?.prvKeyDataIds;
+    const first = Array.isArray(ids) ? ids[0] : undefined;
+    return first ? String(first) : null;
+  }
+
+  private buildRegistry(descriptors: any[]): WalletEntry[] {
+    this.descriptorCache.clear();
+    // The cache keeps EVERY descriptor, hidden ones included: restoring must not have to go back
+    // to accountsEnumerate, which shares the SDK's single WASM thread with the UTXO scan.
+    for (const d of descriptors) this.descriptorCache.set(String(d.accountId), d);
+    const hidden = this.readHiddenWallets();
+    // A hidden wallet drops out of the switcher, the all-wallets total and the balance polling
+    // loop in one move, because every one of them reads `this.wallets`.
+    descriptors = descriptors.filter((d) => !hidden.has(String(d.accountId)));
+    const aliases = this.readAliases();
+    const blobs = this.readSeedBlobs();
+    const previous = new Map(this.wallets.map((w) => [w.accountId, w]));
+    return descriptors.map((d, i) => {
+      const accountId = String(d.accountId);
+      const prvKeyDataId = WalletService.prvKeyIdOf(d);
+      return {
+        accountId,
+        prvKeyDataId,
+        // A local rename wins; otherwise the SDK accountName, which is what survives a
+        // wallet-file export/restore.
+        alias: aliases[accountId] || d.accountName || "Wallet " + (i + 1),
+        receiveAddress: d.receiveAddress ? d.receiveAddress.toString() : null,
+        hasSeed: !!(prvKeyDataId && blobs[prvKeyDataId]),
+        // Keep any balance already polled, so switching wallets doesn't blank the list.
+        balanceSompi: previous.get(accountId)?.balanceSompi ?? null,
+      };
+    });
+  }
+
+  /**
+   * Derive one PUBLIC key generator per wallet (no private keys) so address scanning and the
+   * all-wallets total work later without asking for the password again - we hold the password
+   * exactly once, here at open. Non-fatal per wallet: one unreadable blob must not block unlock.
+   */
+  private derivePubGens(password: string): void {
+    this.pubGens.clear();
+    const blobs = this.readSeedBlobs();
+    for (const entry of this.wallets) {
+      const blob = entry.prvKeyDataId ? blobs[entry.prvKeyDataId] : undefined;
+      if (!blob) continue;
+      try {
+        const phrase = WalletService.decryptPhrase(blob, password);
+        const seed = new kaspa.Mnemonic(phrase).toSeed();
+        this.pubGens.set(
+          entry.accountId,
+          kaspa.PublicKeyGenerator.fromMasterXPrv(
+            new kaspa.XPrv(seed).toString(),
+            false,
+            0n
+          )
+        );
+      } catch {
+        /* that wallet just won't scan derived addresses */
+      }
+    }
+  }
+
+  /** Re-read the account list from the SDK, e.g. after adding a wallet. */
+  private async refreshRegistry(password: string): Promise<void> {
+    const w = this.wallet;
+    if (!w) return;
+    try {
+      const en = await this.withTimeout(
+        w.accountsEnumerate({}),
+        10_000,
+        "accountsEnumerate-registry"
+      );
+      const descriptors = (en.accountDescriptors ?? []) as any[];
+      if (descriptors.length > 0) {
+        this.wallets = this.buildRegistry(descriptors);
+        this.derivePubGens(password);
+      }
+    } catch {
+      /* keep the registry we have */
+    }
+  }
+
+  /**
+   * Make another wallet active.
+   *
+   * Resolves as soon as the LOCAL switch is done. Activating the account starts a UTXO scan that
+   * can be slow or stall outright (the whole reason open() backgrounds connectActivateScan), so it
+   * is fired off in the background rather than awaited: awaiting it left the import dialog spinning
+   * on "Importing…" forever for a wallet that had already been created and made active.
+   */
+  async selectWallet(accountId: string): Promise<void> {
+    if (!this.wallet || !this.isOpen) throw new Error("Wallet is locked.");
+    // Same reason as selectReceiveAddress: a money op captured the active address when it started.
+    if (this.txInFlight) {
+      throw new Error(
+        "A transaction or consolidation is in progress. Stop it before switching wallets."
+      );
+    }
+    if (accountId === this._accountId) return;
+    if (!this.wallets.some((e) => e.accountId === accountId)) {
+      throw new Error("Unknown wallet.");
+    }
+    let acc = this.descriptorCache.get(accountId);
+    if (!acc) {
+      // Only if the cache somehow lacks it (never on a normal open → switch path).
+      const en = await this.withTimeout(
+        this.wallet.accountsEnumerate({}),
+        15_000,
+        "accountsEnumerate-select"
+      );
+      const list = (en.accountDescriptors ?? []) as any[];
+      for (const d of list) this.descriptorCache.set(String(d.accountId), d);
+      acc = this.descriptorCache.get(accountId);
+    }
+    if (!acc) throw new Error("That wallet is no longer in this file.");
+    // Mark the switch BEFORE clearing the balance, so the dashboard can show "loading this
+    // wallet" rather than a hard 0 KRX that reads as a wallet with no funds.
+    this.switchingWallet = accountId;
+    this.adoptAccount(acc);
+    this.balance = { mature: 0n, pending: 0n };
+    this.emit();
+    void this.activateInBackground(accountId);
+  }
+
+  /**
+   * Bring an account's UtxoContext online, off the UI's critical path. Bounded by a timeout so a
+   * stalled scan surfaces as activateError (visible in diagnose()) instead of a promise that never
+   * settles; the RPC balance read below still fills the dashboard in either case.
+   */
+  private async activateInBackground(accountId: string): Promise<void> {
+    const w = this.wallet;
+    if (!w) return;
+    try {
+      await this.withTimeout(
+        w.accountsActivate({ accountIds: [accountId] }),
+        20_000,
+        "accountsActivate-select"
+      );
+      this.activateError = null;
+    } catch (e) {
+      this.activateError = e instanceof Error ? e.message : String(e);
+    }
+    this.emit();
+    // Only drop the switching flag once the new wallet's balance has actually been read: that is
+    // the moment the dashboard stops showing someone else's numbers.
+    try {
+      await this.refreshBalanceFromUtxos();
+    } finally {
+      if (this.switchingWallet === accountId) {
+        this.switchingWallet = null;
+        this.emit();
+      }
+    }
+    void this.refreshWalletTotals();
+  }
+
+  /**
+   * Sum every wallet's mature balance from the node, for the all-wallets total.
+   *
+   * Reads balances over RPC rather than activating every account: activation kicks off a UTXO scan
+   * per account, and that scan is the historically fragile part of this app (see
+   * connectActivateScan). One getBalancesByAddresses call covers every wallet at once.
+   */
+  async refreshWalletTotals(): Promise<void> {
+    if (!this.wallet || this.conn !== "connected" || this.wallets.length === 0) return;
+    const perWallet = new Map<string, string[]>();
+    const all = new Set<string>();
+    for (const entry of this.wallets) {
+      const list = new Set<string>();
+      const gen = this.pubGens.get(entry.accountId);
+      if (gen) {
+        try {
+          for (const a of gen.receiveAddressAsStrings(this._networkId, 0, TOTALS_DEPTH)) list.add(a);
+          for (const a of gen.changeAddressAsStrings(this._networkId, 0, TOTALS_DEPTH)) list.add(a);
+        } catch {
+          /* fall back to the addresses we already know */
+        }
+      }
+      if (entry.receiveAddress) list.add(entry.receiveAddress);
+      if (entry.accountId === this._accountId) {
+        for (const a of this.accountAddresses) list.add(a);
+      }
+      perWallet.set(entry.accountId, [...list]);
+      for (const a of list) all.add(a);
+    }
+    if (all.size === 0) return;
+    const bal = new Map<string, bigint>();
+    try {
+      const res: any = await this.withTimeout(
+        this.wallet.rpc.getBalancesByAddresses([...all]),
+        8000,
+        "getBalancesByAddresses-totals"
+      );
+      for (const e of (res?.entries ?? []) as Array<{ address?: any; balance?: bigint }>) {
+        const ad = e.address?.toString?.() ?? String(e.address ?? "");
+        try {
+          bal.set(ad, BigInt(e.balance ?? 0n));
+        } catch {
+          bal.set(ad, 0n);
+        }
+      }
+    } catch {
+      return; // node unavailable - keep the previous totals rather than showing zeros
+    }
+    for (const entry of this.wallets) {
+      let sum = 0n;
+      for (const a of perWallet.get(entry.accountId) ?? []) sum += bal.get(a) ?? 0n;
+      entry.balanceSompi = sum;
+    }
+    this.emit();
+  }
+
+  private readActiveWalletId(): string | null {
+    try {
+      return localStorage.getItem(ACTIVE_WALLET_KEY);
+    } catch {
+      return null;
+    }
+  }
+
+  private writeActiveWalletId(accountId: string): void {
+    try {
+      localStorage.setItem(ACTIVE_WALLET_KEY, accountId);
+    } catch {
+      /* non-fatal */
+    }
   }
 
   /**
@@ -757,6 +1403,165 @@ class WalletService {
     return base;
   }
 
+  /**
+   * Ask the node for the holder-reward bracket of ONE payout address.
+   *
+   * Returns null — rather than throwing — for the three "nothing to show" cases: no open wallet
+   * or no connection, a node that predates the RPC, and a node still in IBD (its balance and
+   * production indexes are half-built, so any bracket it computed would be fiction). The
+   * unsupported case is latched in `holderRewardUnsupported` so an older node is asked once
+   * instead of on every poll.
+   */
+  async holderRewardFor(address: string): Promise<HolderReward | null> {
+    if (!this.wallet || this.conn !== "connected") return null;
+    if (this.holderRewardUnsupported) return null;
+    const addr = address;
+    if (!addr) return null;
+    try {
+      const r = await this.withTimeout(
+        this.wallet.rpc.getHolderReward({ address: addr }),
+        8_000,
+        "getHolderReward"
+      );
+      return {
+        address: addr,
+        virtualDaaScore: BigInt(r.virtualDaaScore),
+        effBalance: BigInt(r.effBalance),
+        productionRaw: BigInt(r.productionRaw),
+        production: BigInt(r.production),
+        bracketBps: BigInt(r.bracketBps),
+        // The SDK leaves both fields undefined at the top bracket; normalise to null so callers
+        // only ever test one thing.
+        nextBracketBps: r.nextBracketBps == null ? null : BigInt(r.nextBracketBps),
+        nextBracketBalance: r.nextBracketBalance == null ? null : BigInt(r.nextBracketBalance),
+        fullBracketBalance: BigInt(r.fullBracketBalance),
+        windowDaa: BigInt(r.windowDaa),
+        active: !!r.active,
+        paid: BigInt(r.paid),
+        burned: BigInt(r.burned),
+        escrow: BigInt(r.escrow),
+        inference: BigInt(r.inference),
+        // A node predating the field reports nothing; 0n reads as "no coverage", so the panel
+        // omits the income rows rather than passing them off as a full window.
+        incomeWindowDaa: BigInt((r as { incomeWindowDaa?: bigint | number }).incomeWindowDaa ?? 0),
+        // Absent from a node predating the field. Empty reads as "mix unknown", which is right —
+        // an array of zeros would read as "all production at the bottom tier".
+        tierBase: ((r as { tierBase?: Array<bigint | number> }).tierBase ?? []).map((v) => BigInt(v)),
+      };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // A node without the method answers with an unknown-op / not-implemented error rather than
+      // a transport failure; latch on that so we stop asking, but keep retrying real errors
+      // (a timeout, a dropped socket, a node that is still syncing).
+      if (/not\s*implemented|unknown|no\s*such\s*method|invalid\s*op/i.test(msg)) {
+        this.holderRewardUnsupported = true;
+      }
+      return null;
+    }
+  }
+
+  /**
+   * Holder-reward bracket for THIS WALLET — i.e. for whichever of its addresses actually mines.
+   *
+   * A miner's payout address is rarely the address the Receive screen happens to be showing, so
+   * asking only about the active one would report "not a miner" to someone whose payouts land two
+   * addresses over. The active address is still tried first (one call, the common case), and only
+   * if it shows no production do we sweep the account's other known addresses.
+   *
+   * The winner is remembered in `holderRewardAddress` so later polls are a single call again;
+   * it is cleared whenever the account changes (`adoptAccount`), since it belongs to that account.
+   * The sweep is sequential on purpose: these queries hit the node's single RPC path, and firing
+   * 40 at once just to fill one small panel would compete with balance and history reads.
+   */
+  async holderReward(): Promise<HolderReward | null> {
+    if (!this.wallet || this.conn !== "connected") return null;
+    if (this.holderRewardUnsupported) return null;
+
+    // A remembered miner address stays authoritative until the account changes.
+    if (this.holderRewardAddress) {
+      const cached = await this.holderRewardFor(this.holderRewardAddress);
+      if (cached && cached.productionRaw > 0n) return cached;
+      // Production aged out of the window (mining stopped): fall through and re-look.
+      this.holderRewardAddress = null;
+    }
+
+    const seen = new Set<string>();
+    const candidates: string[] = [];
+    for (const a of [this.receiveAddress, ...this.receiveAddresses, ...this.accountAddresses]) {
+      if (a && !seen.has(a)) {
+        seen.add(a);
+        candidates.push(a);
+      }
+    }
+
+    let first: HolderReward | null = null;
+    for (const a of candidates.slice(0, HOLDER_REWARD_SCAN_LIMIT)) {
+      const r = await this.holderRewardFor(a);
+      if (!r) return first; // connection died or the node stopped answering — stop sweeping
+      first ??= r;
+      if (r.productionRaw > 0n) {
+        this.holderRewardAddress = a;
+        return r;
+      }
+    }
+    // Nothing mines: hand back the active address's answer so the caller can still tell
+    // "asked, and this wallet does not mine" from "could not ask".
+    return first;
+  }
+
+  /**
+   * Service-ledger standing of `address`, or null when it cannot be established.
+   *
+   * `getServiceStrikes` reports the whole network keyed by a `miner` hash and takes no address, so
+   * the address is first mapped to its identity with the SDK's `minerKeyForAddress` — derived by
+   * the node's own code, deliberately not reimplemented here: a copy that drifted would match
+   * nothing and report a clean record forever, which is the failure mode that looks like good news.
+   *
+   * A clean identity appears in NONE of the four lists, so "no rows" is a real answer (zeroes),
+   * not a missing one — only a failed call returns null.
+   */
+  async serviceStandingFor(address: string): Promise<ServiceStanding | null> {
+    if (!this.wallet || this.conn !== "connected") return null;
+    if (this.serviceStrikesUnsupported) return null;
+    let me: string;
+    try {
+      me = kaspa.minerKeyForAddress(address);
+    } catch {
+      return null; // not a payout address this node's identity scheme covers
+    }
+    try {
+      const r: any = await this.withTimeout(
+        this.wallet.rpc.getServiceStrikes({}),
+        8_000,
+        "getServiceStrikes"
+      );
+      // Rows are keyed by identity, so `r` is widened deliberately: the SDK's TS interface omits
+      // `lifetimeStrikes` even though the node sends it.
+      const mineAll = (rows: unknown): any[] =>
+        (Array.isArray(rows) ? rows : []).filter((x: any) => x?.miner === me);
+      const strike = mineAll(r.strikes)[0];
+      const susp = mineAll(r.suspended)[0];
+      const burns = mineAll(r.pendingBurns);
+      const life = mineAll(r.lifetimeStrikes)[0];
+      return {
+        consecutiveMisses: Number(strike?.consecutiveMisses ?? 0),
+        lastStrikeDaaScore: strike ? BigInt(strike.lastStrikeDaaScore) : null,
+        suspendedUntilDaaScore: susp ? BigInt(susp.untilDaaScore) : null,
+        // Summed, not first-of: a miner can have several requests pending a burn at once, and
+        // showing one of them would understate what is actually at stake.
+        pendingBurnCount: burns.reduce((n, b) => n + Number(b.burnedClaims ?? 0), 0),
+        pendingBurnSompi: burns.reduce((n, b) => n + BigInt(b.burnedSompi ?? 0), 0n),
+        lifetimeStrikes: Number(life?.strikes ?? 0),
+      };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/not implemented|unknown|unsupported|method/i.test(msg)) {
+        this.serviceStrikesUnsupported = true;
+      }
+      return null;
+    }
+  }
+
   /** Reject after `ms` if a promise hasn't settled — so a hung wallet-core call can't freeze a
    *  diagnostic. The label is surfaced in the thrown message. */
   private withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
@@ -776,18 +1581,35 @@ class WalletService {
    */
   async setNode(settings: NodeSettings): Promise<void> {
     if (!this.wasmReady) throw new Error("WASM not initialized");
+    const endpoint = `${settings.url}|${settings.networkId}`;
+    // Already bound to this endpoint and nothing is open → nothing to rebuild. Boot calls this
+    // right after init(), and a double-invoked effect (React StrictMode in dev, or a remount)
+    // would otherwise build a second kaspa.Wallet while the first is still alive, which corrupts
+    // the shared WASM state.
+    if (this.wallet && this.walletEndpoint === endpoint && !this.isOpen) {
+      this._networkId = settings.networkId;
+      return;
+    }
     if (this.isOpen) {
       await this.lock();
     }
     this._networkId = settings.networkId;
-    // Recreate the wallet bound to the new endpoint/network.
-    this.wallet = new kaspa.Wallet({
-      resident: false,
-      networkId: settings.networkId,
-      encoding: kaspa.Encoding.Borsh,
-      url: settings.url,
-    });
-    this.attachEvents();
+    // A different endpoint may well be a newer node, so re-probe these RPCs instead of staying
+    // latched off because the PREVIOUS node was too old to answer them.
+    this.holderRewardUnsupported = false;
+    this.serviceStrikesUnsupported = false;
+    // Drop the old wallet before building the new one, so the two never coexist. lock() already
+    // stopped it when a wallet was open; this covers the closed case.
+    const previous = this.wallet;
+    this.wallet = null;
+    if (previous) {
+      try {
+        await previous.stop();
+      } catch {
+        /* not started, or already stopped — nothing to unwind */
+      }
+    }
+    this.buildWallet(settings);
     this.emit();
   }
 
@@ -818,6 +1640,10 @@ class WalletService {
     this.receiveAddress = null;
     this.receiveAddresses = [];
     this.pubGen = null;
+    this.pubGens.clear();
+    this.descriptorCache.clear();
+    this.wallets = [];
+    this.switchingWallet = null;
     this.balance = { mature: 0n, pending: 0n };
     this.conn = "disconnected";
     this.synced = false;
@@ -2166,10 +2992,14 @@ class WalletService {
       throw new Error("That address is not one of your wallet's addresses.");
     }
     this.receiveAddress = addr;
-    try {
-      localStorage.setItem(RECEIVE_ACTIVE_KEY, addr);
-    } catch {
-      /* non-fatal */
+    if (this._accountId) {
+      try {
+        const map = WalletService.readMap<string>(RECEIVE_ACTIVE_BY_ACCOUNT_KEY);
+        map[this._accountId] = addr;
+        localStorage.setItem(RECEIVE_ACTIVE_BY_ACCOUNT_KEY, JSON.stringify(map));
+      } catch {
+        /* non-fatal */
+      }
     }
     // Switching account → clear the previous account's balance and load this one's.
     this.balance = { mature: 0n, pending: 0n };
@@ -2269,14 +3099,13 @@ class WalletService {
     this.selectReceiveAddress(addr);
   }
 
-  /** Load the saved switcher list + active selection on open; seed it with the index-0 address. */
+  /** Load the ACTIVE ACCOUNT's saved switcher list + selection; seed it with its own address. */
   private initReceiveList(): void {
+    const accountId = this._accountId;
     let list: string[] = [];
-    try {
-      const raw = localStorage.getItem(RECEIVE_LIST_KEY);
-      if (raw) list = (JSON.parse(raw) as string[]).filter((s) => typeof s === "string");
-    } catch {
-      list = [];
+    if (accountId) {
+      const stored = WalletService.readMap<string[]>(RECEIVE_LIST_BY_ACCOUNT_KEY)[accountId];
+      if (Array.isArray(stored)) list = stored.filter((x) => typeof x === "string");
     }
     if (list.length === 0 && this.receiveAddress) {
       list = [this.receiveAddress];
@@ -2286,22 +3115,68 @@ class WalletService {
       if (!this.accountAddresses.includes(a)) this.accountAddresses.push(a);
     }
     this.persistReceiveList();
-    let active: string | null = null;
-    try {
-      active = localStorage.getItem(RECEIVE_ACTIVE_KEY);
-    } catch {
-      active = null;
-    }
+    const active = accountId
+      ? WalletService.readMap<string>(RECEIVE_ACTIVE_BY_ACCOUNT_KEY)[accountId]
+      : null;
     if (active && this.receiveAddresses.includes(active)) {
       this.receiveAddress = active;
     }
   }
 
   private persistReceiveList(): void {
+    if (!this._accountId) return;
     try {
-      localStorage.setItem(RECEIVE_LIST_KEY, JSON.stringify(this.receiveAddresses));
+      const map = WalletService.readMap(RECEIVE_LIST_BY_ACCOUNT_KEY);
+      map[this._accountId] = this.receiveAddresses;
+      localStorage.setItem(RECEIVE_LIST_BY_ACCOUNT_KEY, JSON.stringify(map));
     } catch {
       /* non-fatal */
+    }
+  }
+
+  /** Read a { [accountId]: T } blob from localStorage, tolerating anything malformed. */
+  private static readMap<T>(key: string): Record<string, T> {
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? (parsed as Record<string, T>) : {};
+    } catch {
+      return {};
+    }
+  }
+
+  /**
+   * Move the pre-multi-wallet flat switcher list under the first account. Those keys held addresses
+   * of the only seed there was; leaving them global would offer one wallet an address derived from
+   * another seed, which it cannot sign for. The v1 keys are left in place so an older build still
+   * works.
+   */
+  private migrateLegacyReceiveList(firstAccountId: string): void {
+    try {
+      const listMap = WalletService.readMap<string[]>(RECEIVE_LIST_BY_ACCOUNT_KEY);
+      if (!listMap[firstAccountId]) {
+        const raw = localStorage.getItem(RECEIVE_LIST_KEY);
+        if (raw) {
+          const legacy = (JSON.parse(raw) as unknown[]).filter(
+            (x): x is string => typeof x === "string"
+          );
+          if (legacy.length > 0) {
+            listMap[firstAccountId] = legacy;
+            localStorage.setItem(RECEIVE_LIST_BY_ACCOUNT_KEY, JSON.stringify(listMap));
+          }
+        }
+      }
+      const activeMap = WalletService.readMap<string>(RECEIVE_ACTIVE_BY_ACCOUNT_KEY);
+      if (!activeMap[firstAccountId]) {
+        const legacyActive = localStorage.getItem(RECEIVE_ACTIVE_KEY);
+        if (legacyActive) {
+          activeMap[firstAccountId] = legacyActive;
+          localStorage.setItem(RECEIVE_ACTIVE_BY_ACCOUNT_KEY, JSON.stringify(activeMap));
+        }
+      }
+    } catch {
+      /* non-fatal: the switcher just starts from the account's own address */
     }
   }
 
@@ -2394,14 +3269,24 @@ class WalletService {
   private ensureWallet() {
     if (!this.wasmReady) throw new Error("WASM not initialized");
     if (!this.wallet) {
-      this.wallet = new kaspa.Wallet({
-        resident: false,
-        networkId: DEFAULT_NODE.networkId,
-        encoding: kaspa.Encoding.Borsh,
-        url: DEFAULT_NODE.url,
-      });
-      this.attachEvents();
+      this.buildWallet(DEFAULT_NODE);
     }
+  }
+
+  /**
+   * Construct the SDK wallet for an endpoint and remember which endpoint it is for. Every
+   * `kaspa.Wallet` owns WASM-side state, so only ever hold one: callers must drop the previous
+   * one (see setNode) rather than letting two coexist.
+   */
+  private buildWallet(settings: NodeSettings) {
+    this.wallet = new kaspa.Wallet({
+      resident: false,
+      networkId: settings.networkId,
+      encoding: kaspa.Encoding.Borsh,
+      url: settings.url,
+    });
+    this.walletEndpoint = `${settings.url}|${settings.networkId}`;
+    this.attachEvents();
   }
 
   private attachEvents() {
@@ -2459,15 +3344,114 @@ class WalletService {
 
 export const wallet = new WalletService();
 
-/** Format sompi (bigint, 1e8 per KRX) to a KRX string. */
+/**
+ * Format sompi (bigint, 1e8 per KRX) to an exact KRX string, trailing zeros trimmed.
+ *
+ * Done with bigint arithmetic rather than the SDK's sompiToKaspaString, which routes through
+ * an f64 and so silently rounds above 2^53 sompi (~90,071,992 KRX): 999999999969999999 came
+ * back as "9999999999.7". This is the formatter the confirm screen uses to state what is
+ * about to be signed, so it has to be exact at every balance. Output matches the SDK's for
+ * everything below that threshold.
+ */
+/**
+ * Holder-reward (ratio-reward) state of ONE payout address, straight from the node's own
+ * consensus indexes (`getHolderReward`, keryx-node >= 1.6). This is the factor the node scales
+ * that address's miner cut by, so it is meaningful only for an address that actually mines.
+ *
+ * `effBalance` is the coin-age EFFECTIVE balance, not the spendable one: coins younger than the
+ * maturity window count at a prorata of their age, so it reads below the wallet balance while a
+ * fresh payout ripens.
+ */
+export interface HolderReward {
+  address: string;
+  virtualDaaScore: bigint;
+  effBalance: bigint;
+  /** Windowed production before the one-block floor. 0n ⇒ this address did not mine in the window. */
+  productionRaw: bigint;
+  production: bigint;
+  bracketBps: bigint;
+  /** Both null exactly when the address is already in the top bracket. */
+  nextBracketBps: bigint | null;
+  nextBracketBalance: bigint | null;
+  fullBracketBalance: bigint;
+  windowDaa: bigint;
+  /** False before the ratio reward activates: the cut is unscaled and the figures are advisory. */
+  active: boolean;
+  /** Miner cut the coinbases actually paid over the window — income, not entitlement. */
+  paid: bigint;
+  /** `productionRaw − paid`: the shortfall the tier and holder brackets destroyed. */
+  burned: bigint;
+  /** Escrow that accrued over the window. 0n for a standard miner (escrow burned at emission);
+   *  CSV-locked and still forfeitable to a service penalty until claimed. */
+  escrow: bigint;
+  /** Inference-reward mints routed to this address over the window. Income won by SERVING an
+   *  inference rather than by producing a block, so it sits outside the base entitlement the
+   *  brackets scale — it is never part of `burned`. */
+  inference: bigint;
+  /** DAA actually spanned by `paid`, `burned`, `escrow` and `inference` — NOT necessarily
+   *  `windowDaa`. Those four come from node-side indexes maintained forward from the boot that
+   *  created them, so a node that has just built them covers only the DAA since; it reaches
+   *  `windowDaa` once a full window has elapsed, and 0n means no coverage at all. The income rows
+   *  must be labelled with this, never with `windowDaa`. */
+  incomeWindowDaa: bigint;
+  /** Base miner cut over `incomeWindowDaa` split by the proven model tier that earned it — the
+   *  MIX, indexed by tier. Empty from a node predating the field. Rigs run different models, so a
+   *  window is a blend and no single tier describes it; take shares over the SUM of these, never
+   *  over the entitlement, since a block with no resolvable tier is left out. */
+  tierBase: bigint[];
+}
+
+/** Service-ledger standing of one payout address, from `getServiceStrikes`. */
+export interface ServiceStanding {
+  /** Consecutive misses currently counted against this identity; 0 when the record is clean. */
+  consecutiveMisses: number;
+  /** DAA of the most recent strike, or null if none stands. */
+  lastStrikeDaaScore: bigint | null;
+  /** Suspended until this DAA, or null when not suspended. While suspended the ENTIRE miner cut
+   *  of this identity's blocks is burned. */
+  suspendedUntilDaaScore: bigint | null;
+  /** Escrow burns finality-deep but not yet applied, with the total at stake. */
+  pendingBurnCount: number;
+  pendingBurnSompi: bigint;
+  /** Strikes over the identity's whole life. Survives the consecutive counter resetting. */
+  lifetimeStrikes: number;
+}
+
 export function formatKrx(sompi: bigint): string {
-  try {
-    return kaspa.sompiToKaspaString(sompi);
-  } catch {
-    const whole = sompi / 100000000n;
-    const frac = (sompi % 100000000n).toString().padStart(8, "0");
-    return `${whole}.${frac}`;
+  const neg = sompi < 0n;
+  const v = neg ? -sompi : sompi;
+  const whole = v / 100000000n;
+  const frac = (v % 100000000n).toString().padStart(8, "0").replace(/0+$/, "");
+  return (neg ? "-" : "") + whole.toString() + (frac ? `.${frac}` : "");
+}
+
+/** Group the integer part of an exact KRX string with thousands separators, for display. Unlike
+ *  formatKrxShort this keeps every decimal, so the result still round-trips through
+ *  normalizeAmountInput + kaspaToSompi without losing sompi. */
+export function groupKrx(krx: string): string {
+  const [whole, frac] = krx.split(".");
+  return whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",") + (frac ? `.${frac}` : "");
+}
+
+/**
+ * Turn whatever is in an amount field into the plain decimal string the node accepts. A field
+ * can legitimately hold our own display formatting (thousands separators) — after "send max",
+ * or from a paste — so separators come off here, but only when the commas form real 3-digit
+ * groups. A lone comma is ambiguous (decimal separator in most of the world, grouping in ours)
+ * and misreading it would move the amount by 1000x, so we refuse instead of guessing.
+ */
+export function normalizeAmountInput(
+  input: string
+): { value: string } | { error: string } {
+  const s = input.trim().replace(/[\s_']/g, "");
+  if (!s) return { error: "Enter an amount." };
+  if (s.includes(",")) {
+    if (!/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(s)) {
+      return { error: "Use a dot for decimals (e.g. 12.5), not a comma." };
+    }
+    return { value: s.replace(/,/g, "") };
   }
+  return { value: s };
 }
 
 /** Display-only KRX: thousands separators + at most 4 decimals (trailing zeros trimmed), TRUNCATED
