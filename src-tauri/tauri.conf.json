@@ -14,8 +14,8 @@
       {
         "label": "main",
         "title": "Keryx Wallet",
-        "width": 980,
-        "height": 720,
+        "width": 1280,
+        "height": 800,
         "minWidth": 420,
         "minHeight": 560,
         "resizable": true,

@@ -1,11 +1,18 @@
+import { readFileSync } from "node:fs";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+
+// Surfaced in the footer so a user can tell which build they are running.
+const { version } = JSON.parse(readFileSync("./package.json", "utf-8")) as {
+  version: string;
+};
 
 // @tauri-apps/cli sets TAURI_DEV_HOST in dev
 const host = process.env.TAURI_DEV_HOST;
 
 export default defineConfig({
   plugins: [react()],
+  define: { __APP_VERSION__: JSON.stringify(version) },
   // Tauri expects a fixed port, fail if not available
   clearScreen: false,
   server: {
