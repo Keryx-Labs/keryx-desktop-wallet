@@ -1,6 +1,6 @@
 # Keryx Wallet
 
-A lightweight, self-custodial desktop wallet for the **Keryx** network, available for **macOS**, **Linux**, and **Windows**.
+A lightweight, self-custodial desktop wallet for the **Keryx** network, available for **macOS**, **Linux**, and **Windows**. It holds your KRX, and it lets you **ask the network's AI models a question directly from the wallet**: uncensored inference, paid on-chain, answered by miners.
 
 Your keys never leave your device. The recovery phrase is encrypted at rest, and every spend is confirmed and signed locally; the wallet only talks to a Keryx node to read balances and broadcast transactions.
 
@@ -18,14 +18,29 @@ Prebuilt binaries are attached to each [GitHub Release](../../releases):
 
 > **macOS note:** the release is currently **unsigned**. On first launch Gatekeeper will warn that the app is from an unidentified developer — right-click the app → **Open** → **Open** to run it. (The release workflow is wired for Apple code signing + notarization via `APPLE_*` repository secrets, so a maintainer with an Apple Developer ID can enable a signed build without code changes.)
 
+## Ask the network: AI inference from the wallet
+
+Keryx miners run open language models alongside proof-of-work, and any wallet can put a question to them. From Home, **Ask the network · AI inference** opens a chat:
+
+1. **Pick a model** from the current lineup (Qwen3.5-9B, GLM-4-9B, Gemma-4-12B, Qwen3.6-27B, Kimi-Linear-48B, all uncensored) and a token budget.
+2. **See the exact cost** before sending: the model's consensus-enforced minimum reward plus a small burned network fee, from about 1 KRX per request.
+3. **Submit.** The wallet builds an `AiRequest` transaction, locks the reward in the chain's keyless vault, signs it locally and broadcasts it. The first miner to serve the request is paid by the chain itself; nobody else can claim the reward.
+4. **Read the answer in the chat.** The wallet watches the chain for the miner's `AiResponse`, fetches the text from IPFS and renders it inline, with a link to the raw result.
+
+Requests are public: they appear on the explorer's inference livefeed. Nothing is sent unless a miner is currently serving the chosen model, and the wallet checks that on-chain before every submission. All of this goes through the wallet's node connection; no account, no API key.
+
 ## Features
 
+- **Ask the network:** on-chain AI inference from the wallet (see above).
 - **Create or import** a wallet from a 24-word recovery phrase, with on-screen backup confirmation.
+- **Several wallets** in one app, switchable from the unlock screen, each with its own alias.
 - **Password unlock** with automatic lock on inactivity.
 - **Dashboard** showing mature and pending balance alongside transaction history.
 - **Send** with address and network validation, fee estimation, and an explicit confirmation step.
 - **Receive** with a copyable address and QR code.
-- **Configurable node endpoint** (wRPC), so you can point the wallet at your own node.
+- **Mining status** on the address card for mining addresses: holder-reward bracket, 24h production, next rung and service standing, read from the explorer API.
+- **Authorise a miner:** sign the escrow delegation a miner needs to mine to your address (Settings).
+- **Public node by default**, with a **configurable node endpoint** (wRPC) so you can point the wallet at your own node.
 
 ## Requirements
 
