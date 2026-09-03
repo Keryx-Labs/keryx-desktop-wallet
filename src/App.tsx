@@ -15,6 +15,7 @@ import { Send } from "./screens/Send";
 import { Receive } from "./screens/Receive";
 import { Consolidate } from "./screens/Consolidate";
 import { Addresses } from "./screens/Addresses";
+import { Chat } from "./screens/Chat";
 import { Header } from "./components/Header";
 import { Footer } from "./components/Footer";
 import { ProgressBar, consolidateRunPercent } from "./components/ProgressBar";
@@ -173,6 +174,7 @@ export default function App() {
       {modal === "receive" && <Receive onClose={closeModal} />}
       {modal === "consolidate" && <Consolidate onClose={closeModal} />}
       {modal === "addresses" && <Addresses onClose={closeModal} />}
+      {modal === "chat" && <Chat onClose={closeModal} />}
       {settingsModal}
     </Shell>
   );

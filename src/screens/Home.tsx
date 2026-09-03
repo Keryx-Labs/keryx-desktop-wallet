@@ -354,6 +354,14 @@ export function Home({ onOpen }: { onOpen: (key: ModalKey) => void }) {
               Receive
             </button>
           </div>
+          <button
+            className="btn-ghost mt-3 w-full"
+            onClick={() => onOpen("chat")}
+            disabled={!canTransact}
+            title={canTransact ? undefined : "Connect to a node first"}
+          >
+            Ask the network · AI inference
+          </button>
           {/* Distinguish the two reasons, the way Send's own banner does: saying "not connected"
               while the status line above reads "connected · node syncing…" is just wrong. */}
           {!canTransact && (
