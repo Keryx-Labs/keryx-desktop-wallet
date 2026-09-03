@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { NodeSettings, wallet } from "../lib/wallet";
+import { Modal } from "./Modal";
 
 const DEFAULT_PORT = "23110"; // Keryx Borsh wRPC default
 
@@ -84,42 +85,40 @@ export function NodeSettingsModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div className="panel max-h-[90vh] w-full max-w-md overflow-y-auto">
-        <h2 className="mb-4 text-lg font-bold text-keryx-green">Settings</h2>
-
+    <Modal title="Settings" size="lg" onClose={onClose}>
         <label className="label">Node IP / host</label>
         <input
-          className="input mb-3 font-mono"
+          className="input mb-3"
           value={host}
           onChange={(e) => setHost(e.target.value)}
           placeholder="127.0.0.1  ·  node.example.com"
         />
         <label className="label">Port</label>
         <input
-          className="input mb-3 font-mono"
+          className="input mb-3"
           value={port}
           onChange={(e) => setPort(e.target.value)}
           inputMode="numeric"
           placeholder={DEFAULT_PORT}
         />
-        <label className="mb-3 flex items-center gap-2 text-sm text-emerald-100/70">
+        <label className="mb-3 flex items-center gap-2 text-sm text-keryx-text">
           <input
             type="checkbox"
+            className="accent-[#2ee358]"
             checked={secure}
             onChange={(e) => setSecure(e.target.checked)}
           />
           Secure (wss) — only if your node has TLS
         </label>
         {insecureRemote && (
-          <p className="mb-3 text-xs text-amber-300">
+          <p className="mb-3 text-xs text-keryx-warn">
             Remote nodes require a secure connection. Enable “Secure (wss)”, or run
             a local node at 127.0.0.1 (e.g. via an SSH tunnel).
           </p>
         )}
-        <p className="mb-3 text-xs text-emerald-200/40">
-          Connects to <span className="font-mono text-keryx-green/70">{previewUrl}</span>.
-          The node must run with <span className="font-mono">--utxoindex</span>.
+        <p className="mb-3 text-xs text-keryx-dim">
+          Connects to <span className="text-keryx-green">{previewUrl}</span>.
+          The node must run with <code className="code-inline">--utxoindex</code>.
         </p>
 
         <button
@@ -132,7 +131,7 @@ export function NodeSettingsModal({
         {testMsg && (
           <p
             className={`mb-4 break-words text-xs ${
-              testMsg.ok ? "text-keryx-green/80" : "text-red-400"
+              testMsg.ok ? "text-keryx-green" : "text-keryx-error"
             }`}
           >
             {testMsg.ok ? "✓ " : "✗ "}
@@ -186,8 +185,7 @@ export function NodeSettingsModal({
         {wallet.hasSeedBackup() && <RevealPhraseSection />}
         {wallet.isOpen && <ChangePasswordSection />}
         {wallet.isOpen && <ExportWalletSection />}
-      </div>
-    </div>
+    </Modal>
   );
 }
 
@@ -240,9 +238,13 @@ function ChangePasswordSection() {
 
   return (
     <div className="mt-4 border-t border-keryx-border pt-4">
-      <h3 className="mb-1 text-sm font-semibold text-keryx-green">
-        Change password
-      </h3>
+      <h3 className="section-label">Change password</h3>
+      <p className="mb-3 text-xs leading-relaxed text-keryx-dim">
+        One password unlocks <b className="text-keryx-ink">every wallet</b> in this app. Changing
+        it re-encrypts all of them{" "}
+        {wallet.walletCount > 1 ? `(${wallet.walletCount} right now)` : ""} — there is no
+        per-wallet password to update separately.
+      </p>
       {!open && (
         <button className="btn-ghost w-full" onClick={() => setOpen(true)}>
           Change password
@@ -274,7 +276,7 @@ function ChangePasswordSection() {
             placeholder="Confirm new password"
             autoComplete="new-password"
           />
-          {err && <p className="mb-3 text-sm text-red-400">{err}</p>}
+          {err && <p className="mb-3 text-sm text-keryx-error">{err}</p>}
           <div className="flex gap-2">
             <button className="btn-ghost flex-1" onClick={reset} disabled={busy}>
               Cancel
@@ -291,7 +293,7 @@ function ChangePasswordSection() {
       )}
       {done && (
         <div>
-          <p className="mb-3 text-sm text-keryx-green">Password changed ✓</p>
+          <p className="mb-3 text-sm text-keryx-bright">Password changed ✓</p>
           <button className="btn-primary w-full" onClick={reset}>
             Done
           </button>
@@ -346,10 +348,8 @@ function ExportWalletSection() {
 
   return (
     <div className="mt-4 border-t border-keryx-border pt-4">
-      <h3 className="mb-1 text-sm font-semibold text-keryx-green">
-        Export wallet file
-      </h3>
-      <p className="mb-3 text-xs text-emerald-200/50">
+      <h3 className="section-label">Export wallet file</h3>
+      <p className="mb-3 text-xs text-keryx-dim">
         Save an <b>encrypted</b> backup of your wallet. It is protected by your
         password and can be restored with “Import”. Keep it safe.
       </p>
@@ -368,7 +368,7 @@ function ExportWalletSection() {
             placeholder="Enter your wallet password"
             autoComplete="current-password"
           />
-          {err && <p className="mb-3 text-sm text-red-400">{err}</p>}
+          {err && <p className="mb-3 text-sm text-keryx-error">{err}</p>}
           <div className="flex gap-2">
             <button className="btn-ghost flex-1" onClick={reset} disabled={busy}>
               Cancel
@@ -385,12 +385,12 @@ function ExportWalletSection() {
       )}
       {exported && (
         <div>
-          <p className="mb-2 text-sm text-keryx-green">
+          <p className="mb-2 text-sm text-keryx-bright">
             Saved “keryx-wallet-backup.txt”. If it didn’t download, copy below:
           </p>
           <textarea
             readOnly
-            className="input mb-2 h-20 break-all font-mono text-[10px]"
+            className="input mb-2 h-20 break-all text-[10px]"
             value={exported}
           />
           <div className="flex gap-2">
@@ -411,6 +411,7 @@ function ExportWalletSection() {
 }
 
 function RevealPhraseSection() {
+  const activeAlias = wallet.activeWallet?.alias ?? null;
   const [open, setOpen] = useState(false);
   const [password, setPassword] = useState("");
   const [phrase, setPhrase] = useState<string | null>(null);
@@ -452,12 +453,15 @@ function RevealPhraseSection() {
 
   return (
     <div className="border-t border-keryx-border pt-4">
-      <h3 className="mb-1 text-sm font-semibold text-keryx-green">
-        Recovery phrase
-      </h3>
-      <p className="mb-3 text-xs text-emerald-200/50">
-        Reveal your recovery phrase to back it up or import the wallet on
-        another device. Anyone with this phrase controls your funds.
+      <h3 className="section-label">Recovery phrase</h3>
+      <p className="mb-3 text-xs leading-relaxed text-keryx-dim">
+        Reveals the phrase of the{" "}
+        <b className="text-keryx-ink">
+          active wallet{activeAlias ? ` — “${activeAlias}”` : ""}
+        </b>
+        , to back it up or import that wallet on another device. Each wallet has its own phrase:
+        switch wallets in “My wallets” to reveal another. Anyone with this phrase controls that
+        wallet's funds.
       </p>
 
       {!open && (
@@ -477,7 +481,7 @@ function RevealPhraseSection() {
             autoComplete="current-password"
             autoFocus
           />
-          {err && <p className="mb-3 text-sm text-red-400">{err}</p>}
+          {err && <p className="mb-3 text-sm text-keryx-error">{err}</p>}
           <div className="flex gap-2">
             <button className="btn-ghost flex-1" onClick={reset}>
               Cancel
@@ -495,7 +499,7 @@ function RevealPhraseSection() {
 
       {phrase && (
         <>
-          <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-2.5 text-xs text-amber-200">
+          <div className="rounded-sm border border-keryx-warn/40 bg-keryx-warn/10 p-2.5 text-xs text-keryx-warn">
             Write it down and keep it offline. Never share it or type it into a
             website.
           </div>
@@ -503,15 +507,15 @@ function RevealPhraseSection() {
             {phrase.split(" ").map((w, i) => (
               <div
                 key={i}
-                className="flex items-center gap-1.5 rounded-lg border border-keryx-border bg-black/30 px-2 py-1.5 text-xs"
+                className="flex items-center gap-1.5 rounded-sm border border-keryx-border bg-keryx-green/[0.03] px-2 py-1.5 text-xs"
               >
-                <span className="text-emerald-200/40">{i + 1}.</span>
-                <span className="font-mono text-keryx-green/90">{w}</span>
+                <span className="text-keryx-dim">{i + 1}.</span>
+                <span className="text-keryx-ink">{w}</span>
               </div>
             ))}
           </div>
           <div className="mt-3 flex items-center justify-end gap-2">
-            <span className="mr-auto text-xs text-emerald-200/40">
+            <span className="mr-auto text-xs text-keryx-dim">
               {copied ? "Copied — clears in ~60s" : "Writing it down is safer"}
             </span>
             <button className="btn-ghost" onClick={copyPhrase}>

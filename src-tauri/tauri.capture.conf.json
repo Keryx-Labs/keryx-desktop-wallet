@@ -1,0 +1,17 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Keryx Wallet (capturable)",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 420,
+        "minHeight": 560,
+        "resizable": true,
+        "contentProtected": false
+      }
+    ]
+  }
+}

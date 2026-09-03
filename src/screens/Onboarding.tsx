@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { wallet } from "../lib/wallet";
-import logo from "../assets/keryx-logo.png";
+import { SeedBackup } from "../components/SeedBackup";
+import { AliasField } from "../components/AliasField";
 
 type Mode = "welcome" | "create" | "import" | "restore";
 
@@ -12,25 +13,24 @@ export function Onboarding({ onReady }: { onReady: () => void }) {
   if (mode === "restore") return <RestoreFileFlow onCancel={() => setMode("welcome")} onReady={onReady} />;
 
   return (
-    <div className="flex min-h-screen items-center justify-center p-4">
-      <div className="panel w-full max-w-md text-center">
-        <img src={logo} alt="Keryx" className="mx-auto mb-4 h-16 w-16 rounded-2xl" />
-        <h1 className="text-2xl font-bold text-keryx-green">Keryx Wallet</h1>
-        <p className="mt-2 text-sm text-emerald-100/60">
-          A self-custodial wallet for the Keryx network. Your keys never leave
-          this device.
-        </p>
-        <div className="mt-8 space-y-3">
-          <button className="btn-primary w-full" onClick={() => setMode("create")}>
-            Create a new wallet
-          </button>
-          <button className="btn-ghost w-full" onClick={() => setMode("import")}>
-            Import recovery phrase
-          </button>
-          <button className="btn-ghost w-full" onClick={() => setMode("restore")}>
-            Restore from wallet file
-          </button>
-        </div>
+    <div className="panel w-full max-w-md text-center">
+      <p className="section-label">Welcome</p>
+      <h1 className="glow text-xl font-bold tracking-widest text-keryx-bright">
+        KERYX WALLET
+      </h1>
+      <p className="mt-3 text-sm leading-relaxed text-keryx-text">
+        A self-custodial wallet for the Keryx network. Your keys never leave this device.
+      </p>
+      <div className="mt-8 space-y-3">
+        <button className="btn-primary w-full" onClick={() => setMode("create")}>
+          Create a new wallet
+        </button>
+        <button className="btn-ghost w-full" onClick={() => setMode("import")}>
+          Import recovery phrase
+        </button>
+        <button className="btn-ghost w-full" onClick={() => setMode("restore")}>
+          Restore from wallet file
+        </button>
       </div>
     </div>
   );
@@ -39,113 +39,19 @@ export function Onboarding({ onReady }: { onReady: () => void }) {
 // --- Create ---
 
 function CreateFlow({ onCancel, onReady }: { onCancel: () => void; onReady: () => void }) {
-  const [step, setStep] = useState<"backup" | "confirm" | "password">("backup");
+  const [step, setStep] = useState<"backup" | "password">("backup");
   const [phrase] = useState<string>(() => wallet.create());
-  const [copied, setCopied] = useState(false);
-
-  // Copying the seed is risky — it lingers on the OS clipboard where any app can read it.
-  // We warn, and best-effort clear the clipboard after a short delay (audit A2).
-  function copyPhrase() {
-    navigator.clipboard
-      ?.writeText(phrase)
-      .then(() => {
-        setCopied(true);
-        window.setTimeout(() => {
-          navigator.clipboard?.writeText("").catch(() => {});
-          setCopied(false);
-        }, 60_000);
-      })
-      .catch(() => {});
-  }
   const words = useMemo(() => phrase.split(" "), [phrase]);
-
-  // Pick two random word indexes for confirmation.
-  const challenge = useMemo(() => {
-    const idxs = new Set<number>();
-    while (idxs.size < 2) idxs.add(Math.floor(Math.random() * words.length));
-    return [...idxs].sort((a, b) => a - b);
-  }, [words]);
-
-  const [answers, setAnswers] = useState<Record<number, string>>({});
-  const [confirmErr, setConfirmErr] = useState<string | null>(null);
-
-  function checkConfirm() {
-    const ok = challenge.every(
-      (i) => (answers[i] ?? "").trim().toLowerCase() === words[i]
-    );
-    if (!ok) {
-      setConfirmErr("Those words do not match. Check your backup.");
-      return;
-    }
-    setConfirmErr(null);
-    setStep("password");
-  }
+  const [alias, setAlias] = useState("");
 
   if (step === "backup") {
     return (
       <Shell title="Back up your recovery phrase">
-        <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-200">
-          Write these 24 words down in order and keep them offline. If you lose
-          this phrase, <b>you lose your funds</b>. Never share it.
-        </div>
-        <div className="mt-4 grid grid-cols-3 gap-2">
-          {words.map((w, i) => (
-            <div
-              key={i}
-              className="flex items-center gap-1.5 rounded-lg border border-keryx-border bg-black/30 px-2 py-1.5 text-sm"
-            >
-              <span className="text-emerald-200/40">{i + 1}.</span>
-              <span className="font-mono text-keryx-green/90">{w}</span>
-            </div>
-          ))}
-        </div>
-        <div className="mt-4 flex items-center justify-end gap-2">
-          <span className="mr-auto text-xs text-emerald-200/40">
-            {copied
-              ? "Copied (clipboard auto-clears in ~60s)"
-              : "Writing it down is safer than copying"}
-          </span>
-          <button className="btn-ghost" onClick={copyPhrase}>
-            {copied ? "Copied ✓" : "Copy"}
-          </button>
-          <button className="btn-primary" onClick={() => setStep("confirm")}>
-            I have written it down
-          </button>
-        </div>
-        <CancelLink onCancel={onCancel} />
-      </Shell>
-    );
-  }
-
-  if (step === "confirm") {
-    return (
-      <Shell title="Confirm your backup">
-        <p className="text-sm text-emerald-100/60">
-          Enter the requested words to confirm you saved your phrase.
-        </p>
-        <div className="mt-4 space-y-3">
-          {challenge.map((i) => (
-            <div key={i}>
-              <label className="label">Word #{i + 1}</label>
-              <input
-                className="input font-mono"
-                value={answers[i] ?? ""}
-                onChange={(e) =>
-                  setAnswers((a) => ({ ...a, [i]: e.target.value }))
-                }
-              />
-            </div>
-          ))}
-        </div>
-        {confirmErr && <p className="mt-3 text-sm text-red-400">{confirmErr}</p>}
-        <div className="mt-5 flex justify-between">
-          <button className="btn-ghost" onClick={() => setStep("backup")}>
-            Back
-          </button>
-          <button className="btn-primary" onClick={checkConfirm}>
-            Continue
-          </button>
-        </div>
+        <SeedBackup
+          words={words}
+          onConfirmed={() => setStep("password")}
+          onCancel={onCancel}
+        />
       </Shell>
     );
   }
@@ -153,8 +59,9 @@ function CreateFlow({ onCancel, onReady }: { onCancel: () => void; onReady: () =
   return (
     <PasswordStep
       onCancel={onCancel}
+      extra={<AliasField value={alias} onChange={setAlias} />}
       onSubmit={async (pw) => {
-        await wallet.finishCreate(pw, phrase);
+        await wallet.finishCreate(pw, phrase, alias);
         onReady();
       }}
     />
@@ -165,6 +72,7 @@ function CreateFlow({ onCancel, onReady }: { onCancel: () => void; onReady: () =
 
 function ImportFlow({ onCancel, onReady }: { onCancel: () => void; onReady: () => void }) {
   const [phrase, setPhrase] = useState("");
+  const [alias, setAlias] = useState("");
   const wordCount = phrase.trim() ? phrase.trim().split(/\s+/).length : 0;
   const validLen = wordCount === 12 || wordCount === 24;
 
@@ -176,20 +84,21 @@ function ImportFlow({ onCancel, onReady }: { onCancel: () => void; onReady: () =
         <div className="mb-4">
           <label className="label">Recovery phrase (12 or 24 words)</label>
           <textarea
-            className="input h-28 resize-none font-mono"
+            className="input h-28 resize-none"
             value={phrase}
             onChange={(e) => setPhrase(e.target.value)}
             placeholder="word1 word2 word3 …"
           />
-          <p className="mt-1 text-xs text-emerald-200/40">
+          <p className="mt-1 text-xs text-keryx-dim">
             {wordCount} word{wordCount === 1 ? "" : "s"}
             {wordCount > 0 && !validLen ? " (expected 12 or 24)" : ""}
           </p>
+          <AliasField value={alias} onChange={setAlias} />
         </div>
       }
       disabled={!validLen}
       onSubmit={async (pw) => {
-        await wallet.importMnemonic(pw, phrase);
+        await wallet.importMnemonic(pw, phrase, alias);
         onReady();
       }}
     />
@@ -227,12 +136,12 @@ function RestoreFileFlow({ onCancel, onReady }: { onCancel: () => void; onReady:
             className="input mb-2 text-xs"
           />
           <textarea
-            className="input h-24 resize-none break-all font-mono text-[10px]"
+            className="input h-24 resize-none break-all text-[10px]"
             value={data}
             onChange={(e) => setData(e.target.value)}
             placeholder="…encrypted wallet backup (hex)…"
           />
-          <p className="mt-1 text-xs text-emerald-200/40">
+          <p className="mt-1 text-xs leading-relaxed text-keryx-dim">
             Enter the password the file was exported with. (Reveal-phrase is not
             available for a file restore; use phrase import if you need it.)
           </p>
@@ -298,7 +207,7 @@ function PasswordStep({
           onChange={(e) => setPw(e.target.value)}
         />
         {tooShort && (
-          <p className="mb-2 text-xs text-amber-300">Use at least 8 characters.</p>
+          <p className="mb-2 text-xs text-keryx-warn">Use at least 8 characters.</p>
         )}
         <label className="label mt-3">Confirm password</label>
         <input
@@ -308,9 +217,9 @@ function PasswordStep({
           onChange={(e) => setPw2(e.target.value)}
         />
         {mismatch && (
-          <p className="mt-2 text-xs text-red-400">Passwords do not match.</p>
+          <p className="mt-2 text-xs text-keryx-error">Passwords do not match.</p>
         )}
-        {error && <p className="mt-3 text-sm text-red-400">{error}</p>}
+        {error && <p className="mt-3 text-sm text-keryx-error">{error}</p>}
         <div className="mt-6 flex justify-between">
           <button type="button" className="btn-ghost" onClick={onCancel}>
             Cancel
@@ -324,26 +233,12 @@ function PasswordStep({
   );
 }
 
+/** Centering is done by App's <main>; this is just the panel and its heading. */
 function Shell({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <div className="flex min-h-screen items-center justify-center p-4">
-      <div className="panel w-full max-w-lg">
-        <h1 className="mb-4 text-xl font-bold text-keryx-green">{title}</h1>
-        {children}
-      </div>
-    </div>
-  );
-}
-
-function CancelLink({ onCancel }: { onCancel: () => void }) {
-  return (
-    <div className="mt-4 text-center">
-      <button
-        className="text-xs text-emerald-200/40 hover:text-emerald-200/70"
-        onClick={onCancel}
-      >
-        Cancel
-      </button>
+    <div className="panel w-full max-w-lg">
+      <h1 className="section-label mb-4">{title}</h1>
+      {children}
     </div>
   );
 }
