@@ -1,9 +1,55 @@
+/*
+ * Design system ported from keryx-labs.com — the app must read as the same product as
+ * the web wallet at keryx-labs.com/wallet. Values below are taken verbatim from the
+ * site's own stylesheet (_next/static/css/4680656494c2b934.css); don't "improve" them
+ * in isolation, change them on the site first.
+ *
+ * Only the latin subset is pulled in: the wallet UI is ASCII (addresses, amounts,
+ * English copy), so the other ~9 subsets the font ships would be dead weight in a
+ * desktop bundle. It is bundled rather than fetched because the Tauri CSP is
+ * `font-src 'self' data:` — a remote webfont would silently fail and drop the whole
+ * UI back to the system monospace.
+ */
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 800;
+  src: url("@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-wght-normal.woff2")
+    format("woff2-variations");
+}
+
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * The palette is stored as space-separated RGB channels rather than hex so Tailwind can
+ * compose it with opacity modifiers (`text-keryx-dim/40`) via rgb(var(--x) / <alpha-value>).
+ * A hex custom property cannot do that.
+ */
 :root {
   color-scheme: dark;
+
+  --mx-bg: 7 10 8; /* #070a08 */
+  --mx-surface: 12 17 13; /* #0c110d */
+  --mx-border: 28 42 32; /* #1c2a20 */
+  --mx-border-hi: 47 74 55; /* #2f4a37 — hover only */
+  --mx-bright: 48 255 103; /* #30ff67 */
+  --mx-green: 46 227 88; /* #2ee358 */
+  --mx-mid: 78 203 106; /* #4ecb6a */
+  --mx-dim: 79 154 96; /* #4f9a60 */
+  --mx-muted: 53 68 58; /* #35443a */
+  --mx-fill: 10 106 52; /* #0a6a34 */
+  --mx-cta: 35 214 88; /* #23d658 */
+  --mx-on-cta: 4 18 10; /* #04120a — text on a filled green */
+  --mx-text: 111 213 131; /* #6fd583 */
+  --mx-error: 224 82 82; /* #e05252 */
+
+  /* Used by the site but not exposed in its :root — lifted from the landing stylesheet. */
+  --mx-warn: 255 215 94; /* #ffd75e (.landing_warn) */
+  --mx-ink: 185 240 197; /* #b9f0c5 (--ink, emphasis text) */
 }
 
 html,
@@ -12,35 +58,121 @@ body,
   height: 100%;
 }
 
+/* Flat background, matching the site's app pages. The landing's radial glow and grid are
+   deliberately not carried over — this window is looked at for hours at a time. */
 body {
   margin: 0;
-  background: radial-gradient(
-      1200px 600px at 50% -10%,
-      rgba(74, 222, 128, 0.08),
-      transparent 60%
-    ),
-    #0a0f0d;
-  color: #e6f2ec;
+  background-color: rgb(var(--mx-bg));
+  color: rgb(var(--mx-text));
+  font-family: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
   -webkit-font-smoothing: antialiased;
 }
 
+::selection {
+  background: rgba(0, 229, 51, 0.25);
+  color: #eafff0;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: rgb(var(--mx-bg));
+}
+::-webkit-scrollbar-thumb {
+  background: #223328;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #2e4436;
+}
+
+:focus-visible {
+  outline: 1px solid rgb(var(--mx-green));
+  outline-offset: 2px;
+}
+
+/*
+ * A <select>'s open list is painted outside the page by the platform. It picks up the page's
+ * text colour but not its background, so the dim greens landed on a near-white list and were
+ * unreadable. `color-scheme` on the element itself is what makes the popup render dark, and the
+ * option colours are set explicitly because the popup ignores inherited background.
+ */
+select {
+  color-scheme: dark;
+}
+select option,
+select optgroup {
+  background-color: rgb(var(--mx-surface));
+  color: rgb(var(--mx-ink));
+}
+
 @layer components {
+  /* --- surfaces --------------------------------------------------------- */
+  .card {
+    @apply rounded border border-keryx-border;
+    background: linear-gradient(180deg, #0d130f, #0b0f0c);
+  }
+  .card-hover {
+    @apply transition-[border-color,transform,box-shadow] duration-200;
+  }
+  .card-hover:hover {
+    @apply -translate-y-0.5 border-keryx-borderHi shadow-card;
+  }
+  /* Every screen already reaches for .panel — keeping it as padded .card restyles them all. */
+  .panel {
+    @apply card p-5;
+  }
+
+  /* --- controls --------------------------------------------------------- */
   .btn {
-    @apply inline-flex items-center justify-center rounded-xl px-4 py-2.5 text-sm font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50;
+    @apply inline-flex items-center justify-center rounded-sm border px-4 py-2.5 text-xs font-semibold uppercase tracking-label transition-all disabled:cursor-not-allowed disabled:opacity-50;
   }
   .btn-primary {
-    @apply btn bg-keryx-green text-keryx-dark hover:bg-emerald-300;
+    @apply btn border-keryx-cta bg-keryx-cta text-keryx-onCta;
+  }
+  .btn-primary:hover:not(:disabled) {
+    @apply border-[#21f04f] bg-[#21f04f] shadow-cta;
   }
   .btn-ghost {
-    @apply btn border border-keryx-border bg-transparent text-keryx-green hover:bg-keryx-panel;
+    @apply btn border-keryx-border bg-keryx-green/[0.03] text-keryx-dim;
+  }
+  .btn-ghost:hover:not(:disabled) {
+    @apply border-keryx-green text-keryx-green;
   }
   .input {
-    @apply w-full rounded-xl border border-keryx-border bg-black/30 px-3.5 py-2.5 text-sm text-keryx-green/90 placeholder-emerald-200/30 outline-none focus:border-keryx-green/60 focus:shadow-glow;
+    @apply w-full rounded-sm border border-keryx-border bg-keryx-green/[0.03] px-3.5 py-2.5 text-sm text-keryx-ink placeholder-keryx-dim outline-none transition-colors focus:border-keryx-green;
   }
-  .panel {
-    @apply rounded-2xl border border-keryx-border bg-keryx-panel/80 p-6 shadow-xl backdrop-blur;
-  }
+
+  /* --- labels & type ---------------------------------------------------- */
   .label {
-    @apply mb-1.5 block text-xs font-medium uppercase tracking-wide text-emerald-200/50;
+    @apply mb-1.5 block text-[10px] font-medium uppercase tracking-label text-keryx-dim;
+  }
+  /* The site's signature block heading: `// RECEIVED`. */
+  .section-label {
+    @apply label;
+  }
+  .section-label::before {
+    content: "// ";
+    color: rgb(var(--mx-muted));
+  }
+  .badge {
+    @apply inline-flex items-center gap-2 rounded-full border border-keryx-border px-3 py-1 text-[11px] tracking-wide text-keryx-text;
+  }
+  .badge-on {
+    @apply badge border-keryx-green bg-keryx-green text-keryx-onCta;
+  }
+  .code-inline {
+    @apply rounded-[5px] border border-keryx-border bg-keryx-green/[0.06] px-1.5 py-px text-[0.82em] text-keryx-green;
+  }
+  /* Amounts and counts: fixed-width digits so columns of numbers don't jitter on refresh. */
+  .num {
+    @apply font-mono tabular-nums;
+  }
+
+  /* --- effects (moderate: text glow + card hover only) ------------------ */
+  .glow {
+    text-shadow: 0 0 10px rgba(46, 227, 88, 0.2);
   }
 }
