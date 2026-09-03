@@ -73,7 +73,7 @@ function ratio1dp(a: bigint, b: bigint): string {
 }
 
 /**
- * The node's holder-reward (ratio-reward) verdict for the active receive address.
+ * The holder-reward (ratio-reward) verdict for the active receive address, from the explorer API.
  *
  * Renders nothing at all unless the node says this address actually mined inside the window
  * (`productionRaw > 0`): the bracket scales a MINER cut, so for a plain holding address there is
@@ -417,7 +417,7 @@ export function HolderRewardPanel() {
       )}
       {!incomeCovered && (
         <p className="mt-2 text-[10px] leading-snug text-keryx-dim">
-          Mined / burned split not available from this node yet.
+          Mined / burned split not available yet.
         </p>
       )}
 
