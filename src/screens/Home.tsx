@@ -3,8 +3,8 @@ import { usePagedSearch } from "../lib/usePagedSearch";
 import { Pager, TxSearch, TypeFilter } from "../components/Pager";
 import { wallet, formatKrxShort, HistoryEntry, ReceivedEntry } from "../lib/wallet";
 import { useWalletState } from "../lib/useWallet";
-import { ModalKey } from "../lib/nav";
 import { HolderRewardPanel } from "../components/HolderReward";
+import { ModalKey } from "../lib/nav";
 
 const HISTORY_POLL_MS = 15_000;
 /**
@@ -337,8 +337,8 @@ export function Home({ onOpen }: { onOpen: (key: ModalKey) => void }) {
             </p>
           )}
 
-          {/* Mining status for this address, from the node's own consensus indexes. Renders
-              nothing for a non-mining address. */}
+          {/* Mining status for this address, from the explorer API. Renders nothing for a
+              non-mining address. */}
           <HolderRewardPanel />
 
           <div className="mt-6 flex gap-3">

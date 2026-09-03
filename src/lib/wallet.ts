@@ -55,9 +55,21 @@ const RECEIVE_LIST_BY_ACCOUNT_KEY = "keryx.wallet.receivelist.v2";
 const RECEIVE_ACTIVE_BY_ACCOUNT_KEY = "keryx.wallet.receiveactive.v2";
 /** Receive+change depth scanned per wallet when summing the all-wallets total. */
 const TOTALS_DEPTH = 20;
-/** How many of an account's addresses to test for mining production before giving up. Payout
- *  addresses sit at low derivation indexes in practice; this only runs until one is found. */
-const HOLDER_REWARD_SCAN_LIMIT = 40;
+/** How many of an account's addresses to test for mining production before giving up. */
+const HOLDER_REWARD_SCAN_LIMIT = 20;
+
+/** Base URL of the Keryx Labs explorer API for the active network. */
+function explorerApiBase(networkId: string): string {
+  return networkId === "mainnet" ? "https://keryx-labs.com" : "https://testnet.keryx-labs.com";
+}
+
+/** JSON integer (sompi / DAA) to bigint; null, undefined and non-numbers read as 0n. */
+function jsonBig(v: unknown): bigint {
+  if (typeof v === "bigint") return v;
+  if (typeof v === "number" && Number.isFinite(v)) return BigInt(Math.trunc(v));
+  if (typeof v === "string" && /^-?\d+$/.test(v)) return BigInt(v);
+  return 0n;
+}
 
 export interface NodeSettings {
   url: string;
@@ -185,6 +197,8 @@ class WalletService {
   private walletEndpoint: string | null = null;
   private _accountId: string | null = null;
   private _networkId: string = DEFAULT_NODE.networkId;
+  /** The account address found to be mining, so the sweep runs once — see `holderReward`. */
+  private holderRewardAddress: string | null = null;
 
   // observable state
   addressPrefix: string | null = null;
@@ -203,12 +217,6 @@ class WalletService {
   private pubGen: kaspa.PublicKeyGenerator | null = null;
   /** Every wallet in the file, in creation order. Empty while locked. */
   wallets: WalletEntry[] = [];
-  /** Latched once a node answers `getHolderReward` with "no such method" — see `holderReward`. */
-  private holderRewardUnsupported = false;
-  /** Same latch for `getServiceStrikes`, so an old node is asked once, not every poll. */
-  private serviceStrikesUnsupported = false;
-  /** The account address found to be mining, so the sweep runs once — see `holderReward`. */
-  private holderRewardAddress: string | null = null;
   /** Per-wallet public-key generators, derived at open() from each stored phrase. Memory only. */
   private pubGens = new Map<string, kaspa.PublicKeyGenerator>();
   /**
@@ -861,8 +869,6 @@ class WalletService {
     this._accountId = String(acc.accountId);
     this.receiveAddress = acc.receiveAddress ? acc.receiveAddress.toString() : null;
     this.gotBalanceEvent = false;
-    // Belongs to the account we are leaving: keeping it would report the previous wallet's
-    // mining status under the new wallet's balance.
     this.holderRewardAddress = null;
     this.accountAddresses = this.collectDescriptorAddresses(acc);
     // Each wallet needs ITS OWN generator: another seed's would derive addresses this account
@@ -1403,88 +1409,70 @@ class WalletService {
     return base;
   }
 
-  /**
-   * Ask the node for the holder-reward bracket of ONE payout address.
-   *
-   * Returns null — rather than throwing — for the three "nothing to show" cases: no open wallet
-   * or no connection, a node that predates the RPC, and a node still in IBD (its balance and
-   * production indexes are half-built, so any bracket it computed would be fiction). The
-   * unsupported case is latched in `holderRewardUnsupported` so an older node is asked once
-   * instead of on every poll.
-   */
-  async holderRewardFor(address: string): Promise<HolderReward | null> {
-    if (!this.wallet || this.conn !== "connected") return null;
-    if (this.holderRewardUnsupported) return null;
-    const addr = address;
-    if (!addr) return null;
+  private async explorerGet(path: string, label: string): Promise<Record<string, unknown> | null> {
     try {
-      const r = await this.withTimeout(
-        this.wallet.rpc.getHolderReward({ address: addr }),
-        8_000,
-        "getHolderReward"
+      const res = await this.withTimeout(
+        fetch(`${explorerApiBase(this._networkId)}${path}`),
+        10_000,
+        label
       );
-      return {
-        address: addr,
-        virtualDaaScore: BigInt(r.virtualDaaScore),
-        effBalance: BigInt(r.effBalance),
-        productionRaw: BigInt(r.productionRaw),
-        production: BigInt(r.production),
-        bracketBps: BigInt(r.bracketBps),
-        // The SDK leaves both fields undefined at the top bracket; normalise to null so callers
-        // only ever test one thing.
-        nextBracketBps: r.nextBracketBps == null ? null : BigInt(r.nextBracketBps),
-        nextBracketBalance: r.nextBracketBalance == null ? null : BigInt(r.nextBracketBalance),
-        fullBracketBalance: BigInt(r.fullBracketBalance),
-        windowDaa: BigInt(r.windowDaa),
-        active: !!r.active,
-        paid: BigInt(r.paid),
-        burned: BigInt(r.burned),
-        escrow: BigInt(r.escrow),
-        inference: BigInt(r.inference),
-        // A node predating the field reports nothing; 0n reads as "no coverage", so the panel
-        // omits the income rows rather than passing them off as a full window.
-        incomeWindowDaa: BigInt((r as { incomeWindowDaa?: bigint | number }).incomeWindowDaa ?? 0),
-        // Absent from a node predating the field. Empty reads as "mix unknown", which is right —
-        // an array of zeros would read as "all production at the bottom tier".
-        tierBase: ((r as { tierBase?: Array<bigint | number> }).tierBase ?? []).map((v) => BigInt(v)),
-      };
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      // A node without the method answers with an unknown-op / not-implemented error rather than
-      // a transport failure; latch on that so we stop asking, but keep retrying real errors
-      // (a timeout, a dropped socket, a node that is still syncing).
-      if (/not\s*implemented|unknown|no\s*such\s*method|invalid\s*op/i.test(msg)) {
-        this.holderRewardUnsupported = true;
-      }
+      if (!res.ok) return null;
+      const body = (await res.json()) as Record<string, unknown>;
+      return body && typeof body === "object" && !("error" in body) ? body : null;
+    } catch {
       return null;
     }
   }
 
   /**
-   * Holder-reward bracket for THIS WALLET — i.e. for whichever of its addresses actually mines.
-   *
-   * A miner's payout address is rarely the address the Receive screen happens to be showing, so
-   * asking only about the active one would report "not a miner" to someone whose payouts land two
-   * addresses over. The active address is still tried first (one call, the common case), and only
-   * if it shows no production do we sweep the account's other known addresses.
-   *
-   * The winner is remembered in `holderRewardAddress` so later polls are a single call again;
-   * it is cleared whenever the account changes (`adoptAccount`), since it belongs to that account.
-   * The sweep is sequential on purpose: these queries hit the node's single RPC path, and firing
-   * 40 at once just to fill one small panel would compete with balance and history reads.
+   * Holder-reward bracket of ONE payout address, from the explorer API. Null when the wallet is
+   * closed, disconnected, or the API did not answer; a non-mining address answers with
+   * `productionRaw === 0n`.
+   */
+  async holderRewardFor(address: string): Promise<HolderReward | null> {
+    if (!this.wallet || this.conn !== "connected") return null;
+    const r = await this.explorerGet(
+      `/api/v1/addresses/${encodeURIComponent(address)}/holder-reward`,
+      "holder-reward"
+    );
+    if (!r) return null;
+    const productionRaw = r.is_miner ? jsonBig(r.production_24h_sompi) : 0n;
+    const next = r.next_bracket as Record<string, unknown> | null | undefined;
+    return {
+      address,
+      virtualDaaScore: jsonBig(r.tip_daa),
+      effBalance: jsonBig(r.balance_sompi),
+      productionRaw,
+      production: productionRaw > 0n ? productionRaw : 1n,
+      bracketBps: jsonBig(r.bracket_bps),
+      nextBracketBps: next ? jsonBig(next.bps) : null,
+      nextBracketBalance: next ? jsonBig(next.target_balance_sompi) : null,
+      fullBracketBalance: jsonBig(r.full_bracket_balance_sompi),
+      windowDaa: jsonBig(r.window_daa),
+      active: true,
+      // Income split (paid / burned / escrow / inference / tier mix) is not served yet; the panel
+      // hides those rows while `incomeWindowDaa` is 0n.
+      paid: 0n,
+      burned: 0n,
+      escrow: 0n,
+      inference: 0n,
+      incomeWindowDaa: 0n,
+      tierBase: [],
+    };
+  }
+
+  /**
+   * Holder-reward standing of the account: the active receive address first, then the account's
+   * other known addresses until one shows production. The winner is remembered in
+   * `holderRewardAddress` so later polls are a single call; cleared on account change.
    */
   async holderReward(): Promise<HolderReward | null> {
     if (!this.wallet || this.conn !== "connected") return null;
-    if (this.holderRewardUnsupported) return null;
-
-    // A remembered miner address stays authoritative until the account changes.
     if (this.holderRewardAddress) {
       const cached = await this.holderRewardFor(this.holderRewardAddress);
       if (cached && cached.productionRaw > 0n) return cached;
-      // Production aged out of the window (mining stopped): fall through and re-look.
       this.holderRewardAddress = null;
     }
-
     const seen = new Set<string>();
     const candidates: string[] = [];
     for (const a of [this.receiveAddress, ...this.receiveAddresses, ...this.accountAddresses]) {
@@ -1493,73 +1481,38 @@ class WalletService {
         candidates.push(a);
       }
     }
-
     let first: HolderReward | null = null;
     for (const a of candidates.slice(0, HOLDER_REWARD_SCAN_LIMIT)) {
       const r = await this.holderRewardFor(a);
-      if (!r) return first; // connection died or the node stopped answering — stop sweeping
+      if (!r) return first;
       first ??= r;
       if (r.productionRaw > 0n) {
         this.holderRewardAddress = a;
         return r;
       }
     }
-    // Nothing mines: hand back the active address's answer so the caller can still tell
-    // "asked, and this wallet does not mine" from "could not ask".
     return first;
   }
 
-  /**
-   * Service-ledger standing of `address`, or null when it cannot be established.
-   *
-   * `getServiceStrikes` reports the whole network keyed by a `miner` hash and takes no address, so
-   * the address is first mapped to its identity with the SDK's `minerKeyForAddress` — derived by
-   * the node's own code, deliberately not reimplemented here: a copy that drifted would match
-   * nothing and report a clean record forever, which is the failure mode that looks like good news.
-   *
-   * A clean identity appears in NONE of the four lists, so "no rows" is a real answer (zeroes),
-   * not a missing one — only a failed call returns null.
-   */
+  /** Service-ledger standing of one payout address, from the explorer API. */
   async serviceStandingFor(address: string): Promise<ServiceStanding | null> {
     if (!this.wallet || this.conn !== "connected") return null;
-    if (this.serviceStrikesUnsupported) return null;
-    let me: string;
-    try {
-      me = kaspa.minerKeyForAddress(address);
-    } catch {
-      return null; // not a payout address this node's identity scheme covers
-    }
-    try {
-      const r: any = await this.withTimeout(
-        this.wallet.rpc.getServiceStrikes({}),
-        8_000,
-        "getServiceStrikes"
-      );
-      // Rows are keyed by identity, so `r` is widened deliberately: the SDK's TS interface omits
-      // `lifetimeStrikes` even though the node sends it.
-      const mineAll = (rows: unknown): any[] =>
-        (Array.isArray(rows) ? rows : []).filter((x: any) => x?.miner === me);
-      const strike = mineAll(r.strikes)[0];
-      const susp = mineAll(r.suspended)[0];
-      const burns = mineAll(r.pendingBurns);
-      const life = mineAll(r.lifetimeStrikes)[0];
-      return {
-        consecutiveMisses: Number(strike?.consecutiveMisses ?? 0),
-        lastStrikeDaaScore: strike ? BigInt(strike.lastStrikeDaaScore) : null,
-        suspendedUntilDaaScore: susp ? BigInt(susp.untilDaaScore) : null,
-        // Summed, not first-of: a miner can have several requests pending a burn at once, and
-        // showing one of them would understate what is actually at stake.
-        pendingBurnCount: burns.reduce((n, b) => n + Number(b.burnedClaims ?? 0), 0),
-        pendingBurnSompi: burns.reduce((n, b) => n + BigInt(b.burnedSompi ?? 0), 0n),
-        lifetimeStrikes: Number(life?.strikes ?? 0),
-      };
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (/not implemented|unknown|unsupported|method/i.test(msg)) {
-        this.serviceStrikesUnsupported = true;
-      }
-      return null;
-    }
+    const r = await this.explorerGet(
+      `/api/v1/addresses/${encodeURIComponent(address)}/service-strikes`,
+      "service-strikes"
+    );
+    if (!r) return null;
+    const burns = Array.isArray(r.pending_burns) ? (r.pending_burns as Record<string, unknown>[]) : [];
+    const lastStrike = r.last_strike_daa_score;
+    const suspended = r.suspended_until_daa_score;
+    return {
+      consecutiveMisses: Number(r.consecutive_misses ?? 0),
+      lastStrikeDaaScore: lastStrike == null ? null : jsonBig(lastStrike),
+      suspendedUntilDaaScore: suspended == null ? null : jsonBig(suspended),
+      pendingBurnCount: burns.length,
+      pendingBurnSompi: burns.reduce((acc, b) => acc + jsonBig(b.burnedSompi ?? b.burned_sompi), 0n),
+      lifetimeStrikes: Number(r.lifetime_strikes ?? 0),
+    };
   }
 
   /** Reject after `ms` if a promise hasn't settled — so a hung wallet-core call can't freeze a
@@ -1594,10 +1547,6 @@ class WalletService {
       await this.lock();
     }
     this._networkId = settings.networkId;
-    // A different endpoint may well be a newer node, so re-probe these RPCs instead of staying
-    // latched off because the PREVIOUS node was too old to answer them.
-    this.holderRewardUnsupported = false;
-    this.serviceStrikesUnsupported = false;
     // Drop the old wallet before building the new one, so the two never coexist. lock() already
     // stopped it when a wallet was open; this covers the closed case.
     const previous = this.wallet;
@@ -3354,66 +3303,37 @@ export const wallet = new WalletService();
  * everything below that threshold.
  */
 /**
- * Holder-reward (ratio-reward) state of ONE payout address, straight from the node's own
- * consensus indexes (`getHolderReward`, keryx-node >= 1.6). This is the factor the node scales
- * that address's miner cut by, so it is meaningful only for an address that actually mines.
- *
- * `effBalance` is the coin-age EFFECTIVE balance, not the spendable one: coins younger than the
- * maturity window count at a prorata of their age, so it reads below the wallet balance while a
- * fresh payout ripens.
+ * Holder-reward (ratio-reward) state of ONE payout address, from the explorer API. Meaningful
+ * only for an address that actually mines. `effBalance` is the coin-age effective balance.
+ * The income fields are reserved for the payout split the API does not serve yet.
  */
 export interface HolderReward {
   address: string;
   virtualDaaScore: bigint;
   effBalance: bigint;
-  /** Windowed production before the one-block floor. 0n ⇒ this address did not mine in the window. */
   productionRaw: bigint;
   production: bigint;
   bracketBps: bigint;
-  /** Both null exactly when the address is already in the top bracket. */
   nextBracketBps: bigint | null;
   nextBracketBalance: bigint | null;
   fullBracketBalance: bigint;
   windowDaa: bigint;
-  /** False before the ratio reward activates: the cut is unscaled and the figures are advisory. */
   active: boolean;
-  /** Miner cut the coinbases actually paid over the window — income, not entitlement. */
   paid: bigint;
-  /** `productionRaw − paid`: the shortfall the tier and holder brackets destroyed. */
   burned: bigint;
-  /** Escrow that accrued over the window. 0n for a standard miner (escrow burned at emission);
-   *  CSV-locked and still forfeitable to a service penalty until claimed. */
   escrow: bigint;
-  /** Inference-reward mints routed to this address over the window. Income won by SERVING an
-   *  inference rather than by producing a block, so it sits outside the base entitlement the
-   *  brackets scale — it is never part of `burned`. */
   inference: bigint;
-  /** DAA actually spanned by `paid`, `burned`, `escrow` and `inference` — NOT necessarily
-   *  `windowDaa`. Those four come from node-side indexes maintained forward from the boot that
-   *  created them, so a node that has just built them covers only the DAA since; it reaches
-   *  `windowDaa` once a full window has elapsed, and 0n means no coverage at all. The income rows
-   *  must be labelled with this, never with `windowDaa`. */
   incomeWindowDaa: bigint;
-  /** Base miner cut over `incomeWindowDaa` split by the proven model tier that earned it — the
-   *  MIX, indexed by tier. Empty from a node predating the field. Rigs run different models, so a
-   *  window is a blend and no single tier describes it; take shares over the SUM of these, never
-   *  over the entitlement, since a block with no resolvable tier is left out. */
   tierBase: bigint[];
 }
 
-/** Service-ledger standing of one payout address, from `getServiceStrikes`. */
+/** Service-ledger standing of one payout address. */
 export interface ServiceStanding {
-  /** Consecutive misses currently counted against this identity; 0 when the record is clean. */
   consecutiveMisses: number;
-  /** DAA of the most recent strike, or null if none stands. */
   lastStrikeDaaScore: bigint | null;
-  /** Suspended until this DAA, or null when not suspended. While suspended the ENTIRE miner cut
-   *  of this identity's blocks is burned. */
   suspendedUntilDaaScore: bigint | null;
-  /** Escrow burns finality-deep but not yet applied, with the total at stake. */
   pendingBurnCount: number;
   pendingBurnSompi: bigint;
-  /** Strikes over the identity's whole life. Survives the consecutive counter resetting. */
   lifetimeStrikes: number;
 }
 
