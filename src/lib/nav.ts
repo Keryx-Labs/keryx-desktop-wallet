@@ -7,5 +7,6 @@ export type ModalKey =
   | "send"
   | "receive"
   | "consolidate"
+  | "chat"
   | "addresses"
   | "settings";
