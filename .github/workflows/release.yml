@@ -1,14 +1,20 @@
 name: release
 
-# Builds Keryx Wallet installers (Windows + Linux) plus a Windows portable .exe and attaches
-# them ALL to a SINGLE draft GitHub Release.
+# Builds Keryx Wallet installers (Windows + Linux + macOS) plus a Windows portable .exe and
+# attaches them ALL to a SINGLE draft GitHub Release.
 # Trigger by pushing a version tag (e.g. `git tag v0.1.1 && git push origin v0.1.1`),
 # or run manually from the Actions tab.
 #
 # A dedicated `create-release` job makes the draft release ONCE and passes its id to the build
-# matrix (via tauri-action's `releaseId`), so the two platform jobs upload to the same release
+# matrix (via tauri-action's `releaseId`), so the platform jobs upload to the same release
 # instead of each racing to create their own draft — which used to produce duplicate drafts.
 # The release is left as a DRAFT for manual review + publish.
+#
+# macOS builds a UNIVERSAL binary (--target universal-apple-darwin) so the single .dmg/.app
+# runs natively on both Apple Silicon and Intel Macs. Apple code signing + notarization are
+# OPTIONAL: set the APPLE_* repository secrets (see the macOS step below) to produce a signed,
+# notarized build; if they are absent the build still succeeds but ships unsigned, so macOS
+# Gatekeeper will show an "unidentified developer" warning (right-click → Open to run).
 #
 # The WASM wallet SDK (src/sdk/) is committed, so CI does NOT rebuild it (no clang/wasm-pack
 # needed) — it only builds the Tauri shell + bundles the prebuilt dist.
@@ -58,6 +64,8 @@ jobs:
         include:
           - platform: windows-latest   # → .msi (WiX) + .exe (NSIS) + portable .exe
           - platform: ubuntu-22.04      # → .deb + .AppImage (+ .rpm)
+          - platform: macos-14          # → universal .app + .dmg (Apple Silicon + Intel)
+            args: '--target universal-apple-darwin'
     runs-on: ${{ matrix.platform }}
 
     steps:
@@ -83,6 +91,12 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # A universal macOS binary is a lipo-merged aarch64 + x86_64 build, so both Apple Silicon
+      # and Intel stdlib targets must be installed. No-op on Windows/Linux (skipped via the `if`).
+      - name: Add macOS Rust targets (universal binary)
+        if: matrix.platform == 'macos-14'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
       - name: Cache cargo
         uses: swatinem/rust-cache@v2
         with:
@@ -95,8 +109,20 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional Apple code signing + notarization. Leave the APPLE_* secrets unset to ship an
+          # unsigned build (Gatekeeper will warn "unidentified developer"; right-click → Open to run).
+          # To sign: set APPLE_SIGNING_IDENTITY (e.g. "Developer ID Application: Team (ID)"), and for
+          # notarization set APPLE_ID, APPLE_PASSWORD (app-specific), and APPLE_TEAM_ID. If you keep
+          # the keychain-less flow, also set APPLE_CERTIFICATE (base64 .p12) + APPLE_CERTIFICATE_PASSWORD.
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: ${{ matrix.args }}
 
       # The portable is a special --features portable --no-bundle build, so tauri-action
       # doesn't emit it. Build it natively on the Windows runner and attach it by release id.
