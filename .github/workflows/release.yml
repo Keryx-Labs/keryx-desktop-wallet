@@ -62,8 +62,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: windows-latest   # → .msi (WiX) + .exe (NSIS) + portable .exe
-          - platform: ubuntu-22.04      # → .deb + .AppImage (+ .rpm)
+          - platform: windows-latest   # → .exe (NSIS) + portable .exe
+          - platform: ubuntu-22.04      # → .deb + .AppImage
           - platform: macos-14          # → universal .app + .dmg (Apple Silicon + Intel)
             args: '--target universal-apple-darwin'
     runs-on: ${{ matrix.platform }}
