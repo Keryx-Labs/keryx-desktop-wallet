@@ -103,7 +103,7 @@ export function Home({ onOpen }: { onOpen: (key: ModalKey) => void }) {
         setHistory(h);
       }
       const r = await wallet.receivedEntries();
-      const rs = r.map((u) => `${u.txid}:${u.index}:${u.amountSompi}`).join("|");
+      const rs = r.map((u) => `${u.txid}:${u.daaScore}:${u.amountSompi}`).join("|");
       if (rs !== recvSig.current) {
         recvSig.current = rs;
         setReceived(r);
@@ -250,7 +250,7 @@ export function Home({ onOpen }: { onOpen: (key: ModalKey) => void }) {
             className="btn-ghost px-2.5 py-0.5 text-[10px]"
             onClick={() => void refreshHistory()}
             aria-busy={loadingHistory}
-            title="Re-read balances and both transaction logs from the node"
+            title="Re-read balances from the node and the transaction history from the explorer"
           >
             <span
               className={`mr-1.5 inline-block h-1 w-1 rounded-full align-middle ${
@@ -394,7 +394,7 @@ export function Home({ onOpen }: { onOpen: (key: ModalKey) => void }) {
         {/* Under xl these two stack inside the second column; at xl `display: contents`
             dissolves this wrapper so each becomes a column of the outer grid. */}
         <div className="grid gap-5 xl:contents">
-          {/* Received — incoming deposits for the ACTIVE account (per-account, persistent forward log). */}
+          {/* Received — incoming transactions for the ACTIVE address, from the explorer API. */}
           <div className="panel flex flex-col">
             <p className="section-label mb-3">Received</p>
             {received.length === 0 ? (
@@ -402,12 +402,14 @@ export function Home({ onOpen }: { onOpen: (key: ModalKey) => void }) {
                 <p className="my-auto px-2 py-6 text-center text-xs text-keryx-dim">Loading…</p>
               ) : (
               <p className="my-auto px-2 py-6 text-center text-xs leading-relaxed text-keryx-dim">
-                Incoming deposits for this account are recorded here from now on and stay even
-                after you spend them.
+                No incoming transactions on this address yet.
               </p>
               )
             ) : (
               <>
+                {/* The kind split needs the coinbase flag; without it every row would count as
+                    "received", so the filter is only offered when the API reports the flag. */}
+                {received.some((u) => u.isCoinbase !== undefined) && (
                 <TypeFilter
                   value={recvKind}
                   onChange={pickRecv}
@@ -425,6 +427,7 @@ export function Home({ onOpen }: { onOpen: (key: ModalKey) => void }) {
                     },
                   ]}
                 />
+                )}
                 <TxSearch value={recv.query} onChange={recv.setQuery} matches={recv.total} />
                 {recv.rows.length === 0 ? (
                   // Reachable two ways, and they need different words: an empty log took the
@@ -445,7 +448,7 @@ export function Home({ onOpen }: { onOpen: (key: ModalKey) => void }) {
                     }`}
                   >
                     {recv.rows.map((u) => (
-                      <ReceivedRow key={`${u.txid}:${u.index}`} u={u} />
+                      <ReceivedRow key={u.txid} u={u} />
                     ))}
                   </ul>
                 )}
@@ -570,7 +573,7 @@ function ReceivedRow({ u }: { u: ReceivedEntry }) {
     <li className="flex items-center justify-between gap-3 py-3">
       <div className="min-w-0">
         <p className="text-sm text-keryx-ink">
-          {u.isCoinbase ? "Mining reward" : "Received"}
+          {u.isCoinbase === true ? "Mining reward" : "Received"}
         </p>
         <div className="flex items-center gap-2">
           {explorer ? (
@@ -595,10 +598,8 @@ function ReceivedRow({ u }: { u: ReceivedEntry }) {
             </button>
           )}
         </div>
-        {u.timestamp && (
-          <p className="mt-0.5 text-xs text-keryx-dim">
-            {new Date(u.timestamp).toLocaleString()}
-          </p>
+        {u.daaScore > 0n && (
+          <p className="num mt-0.5 text-xs text-keryx-dim">DAA {u.daaScore.toLocaleString()}</p>
         )}
       </div>
       <span className="num shrink-0 text-sm font-semibold text-keryx-green">

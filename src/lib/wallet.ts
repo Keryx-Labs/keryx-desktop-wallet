@@ -150,7 +150,9 @@ export interface ReceivedEntry {
   txid: string;
   index: number;
   amountSompi: bigint;
-  timestamp?: number;
+  /** DAA score of the block carrying the transaction. */
+  daaScore: bigint;
+  /** Undefined when the API does not report it. */
   isCoinbase?: boolean;
   /** The account address this deposit landed on (for per-account filtering). */
   address?: string;
@@ -1729,90 +1731,40 @@ class WalletService {
 
   // --- transactions / fees / addresses ---
 
-  /** Per-account incoming deposits (newest first). Records genuine incoming UTXOs (excluding our own
-   *  change) to localStorage as they appear, so the list is per-account and persists after spending. */
-  async receivedEntries(): Promise<ReceivedEntry[]> {
-    await this.syncReceivedLog();
+  /** Incoming transactions for the ACTIVE address, newest first, from the explorer API (the same
+   *  history the explorer and the web wallet show). Spent entries stay listed. */
+  async receivedEntries(limit = 100): Promise<ReceivedEntry[]> {
+    if (!this.wallet) return [];
     const active = this.receiveAddress;
-    return this.readReceivedLog()
-      .filter((e) => (active ? e.address === active : true))
-      .sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
-  }
-
-  private async syncReceivedLog(): Promise<void> {
-    if (!this.wallet || this.accountAddresses.length === 0) return;
-    let entries: any[];
-    try {
-      entries = await this.fetchEntries();
-    } catch {
-      return;
-    }
-    const log = this.readReceivedLog();
-    const seen = new Set(log.map((e) => `${e.txid}:${e.index}`));
-    const ourTxids = new Set(this.readLocalActivity().map((a) => a.id)); // our sends → change
-    let changed = false;
-    const now = Date.now();
-    for (const e of entries) {
-      const txid = String(e.outpoint?.transactionId ?? "");
-      if (!txid) continue;
-      const index = Number(e.outpoint?.index ?? 0);
-      const key = `${txid}:${index}`;
-      if (seen.has(key)) continue;
-      if (ourTxids.has(txid)) continue; // our own change, not an incoming deposit
-      log.push({
-        txid,
-        index,
-        amountSompi: BigInt(e.amount ?? 0n),
-        timestamp: now,
-        isCoinbase: !!e.isCoinbase,
-        address: e.address ? String(e.address) : undefined,
+    if (!active) return [];
+    const body = await this.explorerGet(
+      `/api/v1/addresses/${encodeURIComponent(active)}?limit=${Math.min(Math.max(limit, 1), 100)}`,
+      "address-history"
+    );
+    if (!body) throw new Error("Explorer API unreachable — transaction history not updated.");
+    const rows = Array.isArray(body.transactions) ? (body.transactions as unknown[]) : [];
+    const out: ReceivedEntry[] = [];
+    for (const raw of rows) {
+      const r = raw as {
+        tx_id?: unknown;
+        amount_sompi?: unknown;
+        daa_score?: unknown;
+        is_spend?: unknown;
+        is_coinbase?: unknown;
+      };
+      if (typeof r.tx_id !== "string" || typeof r.amount_sompi !== "number") continue;
+      if (r.is_spend === true || r.amount_sompi <= 0) continue;
+      out.push({
+        txid: r.tx_id,
+        index: 0,
+        amountSompi: BigInt(Math.round(r.amount_sompi)),
+        daaScore: BigInt(typeof r.daa_score === "number" ? Math.round(r.daa_score) : 0),
+        isCoinbase: typeof r.is_coinbase === "boolean" ? r.is_coinbase : undefined,
+        address: active,
       });
-      seen.add(key);
-      changed = true;
     }
-    if (changed) this.writeReceivedLog(log);
-  }
-
-  private readReceivedLog(): ReceivedEntry[] {
-    try {
-      const raw = localStorage.getItem(RECEIVED_LOG_KEY);
-      if (!raw) return [];
-      const arr = JSON.parse(raw) as Array<{
-        txid: string;
-        index: number;
-        amountSompi: string;
-        timestamp?: number;
-        isCoinbase?: boolean;
-        address?: string;
-      }>;
-      return arr.map((e) => ({
-        txid: e.txid,
-        index: e.index,
-        amountSompi: (() => {
-          try {
-            return BigInt(e.amountSompi);
-          } catch {
-            return 0n;
-          }
-        })(),
-        timestamp: e.timestamp,
-        isCoinbase: e.isCoinbase,
-        address: e.address,
-      }));
-    } catch {
-      return [];
-    }
-  }
-
-  private writeReceivedLog(log: ReceivedEntry[]): void {
-    try {
-      const serialized = log
-        .slice(-500)
-        .map((e) => ({ ...e, amountSompi: e.amountSompi.toString() }));
-      localStorage.setItem(RECEIVED_LOG_KEY, JSON.stringify(serialized));
-    } catch {
-      /* localStorage may be unavailable — non-fatal */
-    }
+    out.sort((a, b) => (a.daaScore < b.daaScore ? 1 : a.daaScore > b.daaScore ? -1 : 0));
+    return out;
   }
 
   /**
