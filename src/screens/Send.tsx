@@ -24,7 +24,6 @@ export function Send({ onClose }: { onClose: () => void }) {
   const [dest, setDest] = useState("");
   const [amount, setAmount] = useState(""); // KRX string
   const [fee, setFee] = useState(""); // optional priority fee, KRX string
-  const [password, setPassword] = useState("");
 
   const [step, setStep] = useState<Step>("form");
   const [err, setErr] = useState<string | null>(null);
@@ -133,10 +132,6 @@ export function Send({ onClose }: { onClose: () => void }) {
 
   async function onConfirm() {
     setErr(null);
-    if (!password) {
-      setErr("Enter your password to confirm.");
-      return;
-    }
     if (!frozen) {
       setErr("Please estimate the transaction again.");
       setStep("form");
@@ -166,16 +161,13 @@ export function Send({ onClose }: { onClose: () => void }) {
     try {
       // Send EXACTLY the frozen sompi the user confirmed — never re-parse the fields.
       const ids = await wallet.send(
-        password,
         frozen.dest,
         frozen.amountSompi,
         frozen.priorityFeeSompi
       );
-      setPassword(""); // never keep the secret around
       setTxids(ids);
       setStep("done");
     } catch (e) {
-      setPassword("");
       const msg = e instanceof Error ? e.message : String(e);
       setErr(humanizeSendError(msg));
       setStep("confirm");
@@ -333,18 +325,6 @@ export function Send({ onClose }: { onClose: () => void }) {
               </span>
             </Row>
           </div>
-
-          <label className="label">Confirm with your password</label>
-          <input
-            className="input mb-4"
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="Wallet password"
-            autoComplete="current-password"
-            disabled={step === "sending"}
-            autoFocus
-          />
 
           {err && <p className="mb-3 text-sm text-keryx-error">{err}</p>}
 

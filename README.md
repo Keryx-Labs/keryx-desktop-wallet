@@ -102,8 +102,9 @@ ecosystem. Regenerating the SDK from a newer node release is documented in `SDK_
 ## Security
 
 - The recovery phrase is encrypted at rest (Argon2 key derivation, XChaCha20-Poly1305 encryption) and
-  is never written to logs. Keys are derived in memory only, and the password is requested again for
-  every send.
+  is never written to logs. Keys are derived in memory only. The password is held while the wallet is
+  unlocked so sends and inference requests sign without prompting, and it is dropped on lock or
+  auto-lock.
 - A send validates the destination address and network first, then freezes the confirmed amounts:
   what you confirm is exactly what gets signed.
 - A strict Content Security Policy blocks remote content and inline/eval scripts, and Tauri capabilities

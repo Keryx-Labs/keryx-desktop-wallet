@@ -47,7 +47,6 @@ export function Chat({ onClose }: { onClose: () => void }) {
   const [model, setModel] = useState<ModelName>(DEFAULT_MODEL);
   const [maxTokens, setMaxTokens] = useState<number>(DEFAULT_MAX_TOKENS);
   const [prompt, setPrompt] = useState("");
-  const [password, setPassword] = useState(""); // kept for this chat session only
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [busy, setBusy] = useState(false);
 
@@ -129,13 +128,11 @@ export function Chat({ onClose }: { onClose: () => void }) {
     hasFunds &&
     !busy &&
     wallet.isOpen &&
-    prompt.trim().length > 0 &&
-    password.length > 0;
+    prompt.trim().length > 0;
 
   async function send() {
     if (!canSend) return;
     const text = prompt.trim();
-    const pw = password;
     const model_ = model;
     const maxTokens_ = maxTokens;
     const cost = totalSompi;
@@ -155,7 +152,7 @@ export function Chat({ onClose }: { onClose: () => void }) {
         );
       }
       // 2) build + sign + submit the AiRequest
-      const { txId, requestHashHex, cursorHash } = await wallet.submitInference(pw, {
+      const { txId, requestHashHex, cursorHash } = await wallet.submitInference({
         model: model_,
         prompt: text,
         maxTokens: maxTokens_,
@@ -272,15 +269,6 @@ export function Chat({ onClose }: { onClose: () => void }) {
             balance {formatKrx(w.balance.mature)} KRX
           </span>
         </div>
-        <input
-          type="password"
-          className="input mb-2"
-          placeholder="Wallet password (to sign the request)"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          disabled={busy}
-          autoComplete="off"
-        />
         <div className="flex items-end gap-2">
           <textarea
             className="input min-h-[3rem] flex-1 resize-none"

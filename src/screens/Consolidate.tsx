@@ -17,7 +17,6 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
   const w = useWalletState();
   const run = w.consolidateRun;
 
-  const [password, setPassword] = useState("");
   const [err, setErr] = useState<string | null>(null);
   // Results come from the run on the service, not local state: the run outlives this component, so
   // reopening the window after it finished must still show what happened. A failed run with zero
@@ -74,18 +73,12 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
 
   async function start() {
     setErr(null);
-    if (!password) {
-      setErr("Enter your password.");
-      return;
-    }
     try {
       // The accepted estimate is a hard ceiling: the run trims its last round to the remaining
       // fee budget and stops when it is exhausted, so it can never spend more than confirmed.
-      await wallet.consolidate(password, undefined, cost?.feeSompi);
-      setPassword("");
+      await wallet.consolidate(undefined, cost?.feeSompi);
       void loadStats();
     } catch (e) {
-      setPassword("");
       setErr(
         e instanceof Error ? e.message : typeof e === "string" ? e : "Could not consolidate."
       );
@@ -310,17 +303,6 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
             </div>
           )}
 
-          <label className="label">Confirm with your password</label>
-          <input
-            className="input mb-4"
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="Wallet password"
-            autoComplete="current-password"
-            autoFocus
-          />
-
           {/* Node rejections are long single-line strings; without wrapping they used to blow the
               modal layout apart. */}
           {err && (
@@ -338,7 +320,7 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
             <button
               className="btn-primary flex-1"
               onClick={() => void start()}
-              disabled={!password || count <= 1 || !cost || !confirmed}
+              disabled={count <= 1 || !cost || !confirmed}
               title={
                 count <= 1
                   ? "Nothing to consolidate (1 or fewer UTXOs)"

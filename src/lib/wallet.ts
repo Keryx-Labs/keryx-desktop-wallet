@@ -219,6 +219,8 @@ class WalletService {
   private walletEndpoint: string | null = null;
   private _accountId: string | null = null;
   private _networkId: string = DEFAULT_NODE.networkId;
+  /** Wallet secret held while unlocked so signing does not prompt again; dropped on lock. */
+  private signingSecret: string | null = null;
   /** Endpoint last requested through setNode; what ensureWallet rebuilds against. */
   private nodeSettings: NodeSettings = DEFAULT_NODE;
   /** The account address found to be mining, so the sweep runs once — see `holderReward`. */
@@ -285,6 +287,10 @@ class WalletService {
   }
   get isOpen() {
     return this._accountId !== null;
+  }
+  private requireSigningSecret(): string {
+    if (this.signingSecret === null) throw new Error("Wallet is locked.");
+    return this.signingSecret;
   }
   /** Active account id (hex), or null when locked. */
   get accountId(): string | null {
@@ -849,6 +855,7 @@ class WalletService {
     if (descriptors.length === 0) {
       throw new Error("Wallet has no accounts.");
     }
+    this.signingSecret = password;
     // Every account in the file is one wallet (one seed). A pre-multi-wallet file has exactly one,
     // so this collapses to the old behaviour for it.
     this.migrateLegacySeedBlob(WalletService.prvKeyIdOf(descriptors[0]));
@@ -1604,6 +1611,7 @@ class WalletService {
     this.gotBalanceEvent = false;
     this.accountAddresses = [];
     this._accountId = null;
+    this.signingSecret = null;
     this.receiveAddress = null;
     this.receiveAddresses = [];
     this.pubGen = null;
@@ -1859,16 +1867,15 @@ class WalletService {
 
 
   /**
-   * Send funds. The password is used ONLY here (as walletSecret) and is never
-   * stored or logged. SDK: accountsSend(...) → { transactionIds }.
+   * Send funds, signed with the secret held for the unlocked session.
    * Returns the submitted transaction ids.
    */
   async send(
-    password: string,
     destAddress: string,
     amountSompi: bigint,
     priorityFeeSompi: bigint = 0n
   ): Promise<string[]> {
+    const password = this.requireSigningSecret();
     // The high-level accountsSend hangs in our integration because the account UtxoContext never
     // populates. We build/sign/submit the tx ourselves from node-reported UTXOs + derived keys.
     return this.sendManual(password, destAddress, amountSompi, priorityFeeSompi);
@@ -1881,10 +1888,10 @@ class WalletService {
    * consolidateManual. `onProgress` fires after each confirmed batch. Returns the batch txids.
    */
   async consolidate(
-    password: string,
     onProgress?: (info: ConsolidateProgress) => void,
     maxFeeSompi?: bigint
   ): Promise<string[]> {
+    const password = this.requireSigningSecret();
     // Same reason as send(): bypass the empty UtxoContext and sweep via the manual path.
     // maxFeeSompi = the fee the user accepted in the UI; the run never exceeds it.
     return this.consolidateManual(password, onProgress, maxFeeSompi);
@@ -2310,8 +2317,9 @@ class WalletService {
    * address's key over blake2b-256(domain || escrow_pubkey). The miner passes the 128-hex
    * result as `--escrow-cert`; from H6 a block without a valid key/cert pair is invalid.
    */
-  signEscrowDelegation(password: string, escrowPubkeyHex: string): { cert: string; address: string } {
+  signEscrowDelegation(escrowPubkeyHex: string): { cert: string; address: string } {
     if (!this.isOpen) throw new Error("Open the wallet first.");
+    const password = this.requireSigningSecret();
     const escrowPubkey = escrowPubkeyHex.trim().toLowerCase();
     if (!/^[0-9a-f]{64}$/.test(escrowPubkey)) {
       throw new Error("The escrow key must be 64 hex characters — copy the line the miner prints at startup.");
@@ -2347,7 +2355,6 @@ class WalletService {
    * The reward/fee are computed from the node-enforced minimums for the model.
    */
   async submitInference(
-    password: string,
     req: {
       model: ModelName;
       prompt: string;
@@ -2362,6 +2369,7 @@ class WalletService {
     cursorHash: string;
   }> {
     if (!this.wallet || !this._accountId) throw new Error("Wallet is locked.");
+    const password = this.requireSigningSecret();
     if (this.conn !== "connected" || !this.synced) {
       throw new Error("Connect to a synced node first.");
     }

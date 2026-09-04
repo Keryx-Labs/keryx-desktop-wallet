@@ -549,7 +549,6 @@ function AuthoriseMinerSection() {
   const w = useWalletState();
   const [open, setOpen] = useState(false);
   const [escrowKey, setEscrowKey] = useState("");
-  const [password, setPassword] = useState("");
   const [cert, setCert] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -557,7 +556,6 @@ function AuthoriseMinerSection() {
   function reset() {
     setOpen(false);
     setEscrowKey("");
-    setPassword("");
     setCert(null);
     setErr(null);
     setCopied(false);
@@ -568,8 +566,7 @@ function AuthoriseMinerSection() {
     setCert(null);
     setCopied(false);
     try {
-      const r = wallet.signEscrowDelegation(password, escrowKey);
-      setPassword("");
+      const r = wallet.signEscrowDelegation(escrowKey);
       setCert(r.cert);
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Could not sign the delegation.");
@@ -610,13 +607,6 @@ function AuthoriseMinerSection() {
             placeholder="66aef947…"
             autoFocus
           />
-          <label className="label">Password</label>
-          <input
-            type="password"
-            className="input mb-3"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-          />
           {err && <p className="mb-3 text-sm text-keryx-error">{err}</p>}
           <div className="flex gap-2">
             <button className="btn-ghost flex-1" onClick={reset}>
@@ -625,7 +615,7 @@ function AuthoriseMinerSection() {
             <button
               className="btn-primary flex-1"
               onClick={authorise}
-              disabled={escrowKey.trim().length === 0 || password.length === 0}
+              disabled={escrowKey.trim().length === 0}
             >
               Authorise →
             </button>
