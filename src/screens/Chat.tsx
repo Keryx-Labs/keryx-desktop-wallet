@@ -11,6 +11,7 @@ import { fetchAnswerText } from "../lib/aiResponse";
 
 const TOKEN_PRESETS = [128, 256, 512] as const;
 const DEFAULT_MODEL: ModelName = "qwen3.5-9b-abliterated";
+const CAPS_POLL_MS = 30_000;
 const DEFAULT_MAX_TOKENS = 256;
 
 const MODEL_ORDER: ModelName[] = [
@@ -49,6 +50,20 @@ export function Chat({ onClose }: { onClose: () => void }) {
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [busy, setBusy] = useState(false);
+  // Active miners per model_id hex (explorer API, last 20 min); null until the first answer.
+  const [caps, setCaps] = useState<Map<string, number> | null>(null);
+  useEffect(() => {
+    let alive = true;
+    const load = () => void wallet.fetchCapabilities().then((c) => alive && c && setCaps(c));
+    load();
+    const id = setInterval(load, CAPS_POLL_MS);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, [w.networkId]);
+  const minersFor = (k: ModelName) => caps?.get(MODELS[k].modelIdHex) ?? 0;
+  const activeMiners = caps ? minersFor(model) : null;
 
   const scrollRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -207,6 +222,7 @@ export function Chat({ onClose }: { onClose: () => void }) {
             {MODEL_ORDER.map((k) => (
               <option key={k} value={k}>
                 {MODELS[k].label}
+                {caps ? ` · ${minersFor(k)} miner${minersFor(k) === 1 ? "" : "s"}` : ""}
               </option>
             ))}
           </select>
@@ -228,18 +244,17 @@ export function Chat({ onClose }: { onClose: () => void }) {
         </label>
       </div>
 
-      {/* guardrails */}
-      <div className="space-y-1 border-b border-keryx-border bg-black/20 px-5 py-2 text-[11px] leading-snug text-emerald-200/50">
-        <p>
-          ⚠️ <b>On-chain &amp; readable:</b> your prompt is written on-chain and the
-          answer is stored on IPFS. Your wallet marks these to stay off the public
-          inference feed, but they are not encrypted — not private messaging.
-        </p>
-        <p>
-          ⚠️ <b>Optimistic:</b> answers are served under a challenge window, not
-          cryptographically verified. Don't rely on them as ground truth.
-        </p>
-      </div>
+      {activeMiners !== null && (
+        <div
+          className={`border-b border-keryx-border px-5 py-2 font-mono text-[11px] ${
+            activeMiners > 0 ? "text-keryx-dim" : "text-keryx-error"
+          }`}
+        >
+          {activeMiners > 0
+            ? `${activeMiners} active miner${activeMiners > 1 ? "s" : ""} for this model`
+            : `⚠ No active miners for ${MODELS[model].label} in the last 20 minutes.`}
+        </div>
+      )}
 
       {/* messages */}
       <div ref={scrollRef} className="flex-1 space-y-3 overflow-auto px-5 py-4">

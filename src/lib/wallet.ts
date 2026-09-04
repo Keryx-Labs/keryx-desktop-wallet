@@ -1456,6 +1456,32 @@ class WalletService {
   }
 
   /**
+   * Active miners per model from the explorer API, keyed by model_id hex. Null when the API
+   * did not answer.
+   */
+  async fetchCapabilities(): Promise<Map<string, number> | null> {
+    try {
+      const res = await this.withTimeout(
+        fetch(`${explorerApiBase(this._networkId)}/api/v1/capabilities`),
+        10_000,
+        "capabilities"
+      );
+      if (!res.ok) return null;
+      const body = (await res.json()) as unknown;
+      if (!Array.isArray(body)) return null;
+      const out = new Map<string, number>();
+      for (const c of body as Array<{ model_id_hex?: string; miner_count?: number }>) {
+        if (typeof c?.model_id_hex === "string" && typeof c.miner_count === "number") {
+          out.set(c.model_id_hex.toLowerCase(), c.miner_count);
+        }
+      }
+      return out;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Holder-reward bracket of ONE payout address, from the explorer API. Null when the wallet is
    * closed, disconnected, or the API did not answer; a non-mining address answers with
    * `productionRaw === 0n`.
