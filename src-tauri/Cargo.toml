@@ -1,6 +1,6 @@
 [package]
 name = "keryx-wallet"
-version = "1.0.0"
+version = "1.0.1"
 description = "Keryx Wallet"
 authors = ["Keryx"]
 edition = "2021"
