@@ -105,21 +105,37 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
-      - name: Build + bundle (Tauri) → upload to the shared release
-        uses: tauri-apps/tauri-action@v0
+      # Optional Apple code signing + notarization. Leave the APPLE_* secrets unset to ship an
+      # unsigned build (Gatekeeper will warn "unidentified developer"; right-click → Open to run).
+      # To sign: set APPLE_SIGNING_IDENTITY (e.g. "Developer ID Application: Team (ID)"), and for
+      # notarization set APPLE_ID, APPLE_PASSWORD (app-specific), and APPLE_TEAM_ID. If you keep
+      # the keychain-less flow, also set APPLE_CERTIFICATE (base64 .p12) + APPLE_CERTIFICATE_PASSWORD.
+      # An unset secret still reaches a step's `env:` as an EMPTY variable, and the bundler treats
+      # a present-but-empty APPLE_CERTIFICATE as a certificate to import, which fails. So only
+      # export the variables that actually have a value.
+      - name: Export Apple signing secrets (only those set)
+        if: matrix.platform == 'macos-14'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Optional Apple code signing + notarization. Leave the APPLE_* secrets unset to ship an
-          # unsigned build (Gatekeeper will warn "unidentified developer"; right-click → Open to run).
-          # To sign: set APPLE_SIGNING_IDENTITY (e.g. "Developer ID Application: Team (ID)"), and for
-          # notarization set APPLE_ID, APPLE_PASSWORD (app-specific), and APPLE_TEAM_ID. If you keep
-          # the keychain-less flow, also set APPLE_CERTIFICATE (base64 .p12) + APPLE_CERTIFICATE_PASSWORD.
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for v in APPLE_SIGNING_IDENTITY APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -n "${!v}" ]; then
+              { echo "$v<<__EOF__"; echo "${!v}"; echo "__EOF__"; } >> "$GITHUB_ENV"
+              echo "$v: set"
+            else
+              echo "$v: not set"
+            fi
+          done
+
+      - name: Build + bundle (Tauri) → upload to the shared release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           args: ${{ matrix.args }}
