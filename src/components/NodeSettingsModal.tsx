@@ -2,6 +2,7 @@ import { useState } from "react";
 import { DEFAULT_NODES, NodeSettings, wallet } from "../lib/wallet";
 import { useWalletState } from "../lib/useWallet";
 import { Modal } from "./Modal";
+import { Select } from "./Select";
 
 const DEFAULT_PORT = "23110"; // Keryx Borsh wRPC default
 
@@ -153,30 +154,32 @@ export function NodeSettingsModal({
         )}
 
         <label className="label">Network</label>
-        <select
-          className="input mb-4"
+        <Select
+          className="mb-4"
           value={networkId}
-          onChange={(e) => selectNetwork(e.target.value)}
-        >
-          <option value="mainnet">mainnet</option>
-          <option value="testnet-10">testnet-10</option>
-          <option value="simnet">simnet</option>
-        </select>
+          onChange={selectNetwork}
+          options={[
+            { value: "mainnet", label: "mainnet" },
+            { value: "testnet-10", label: "testnet-10" },
+            { value: "simnet", label: "simnet" },
+          ]}
+        />
 
         <label className="label">Auto-lock timeout</label>
-        <select
-          className="input mb-4"
+        <Select
+          className="mb-4"
           value={autoLockMinutes}
-          onChange={(e) => setAutoLockMinutes(e.target.value)}
-        >
-          <option value="1">1 minute</option>
-          <option value="5">5 minutes</option>
-          <option value="15">15 minutes</option>
-          <option value="30">30 minutes</option>
-          <option value="60">1 hour</option>
-          <option value="240">4 hours</option>
-          <option value="0">Never</option>
-        </select>
+          onChange={setAutoLockMinutes}
+          options={[
+            { value: "1", label: "1 minute" },
+            { value: "5", label: "5 minutes" },
+            { value: "15", label: "15 minutes" },
+            { value: "30", label: "30 minutes" },
+            { value: "60", label: "1 hour" },
+            { value: "240", label: "4 hours" },
+            { value: "0", label: "Never" },
+          ]}
+        />
         <div className="mb-6 flex justify-end gap-2">
           <button className="btn-ghost" onClick={onClose}>
             Close

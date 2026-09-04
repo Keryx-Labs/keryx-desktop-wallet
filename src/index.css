@@ -93,21 +93,6 @@ body {
   outline-offset: 2px;
 }
 
-/*
- * A <select>'s open list is painted outside the page by the platform. It picks up the page's
- * text colour but not its background, so the dim greens landed on a near-white list and were
- * unreadable. `color-scheme` on the element itself is what makes the popup render dark, and the
- * option colours are set explicitly because the popup ignores inherited background.
- */
-select {
-  color-scheme: dark;
-}
-select option,
-select optgroup {
-  background-color: rgb(var(--mx-surface));
-  color: rgb(var(--mx-ink));
-}
-
 @layer components {
   /* --- surfaces --------------------------------------------------------- */
   .card {
