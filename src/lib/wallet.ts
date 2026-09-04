@@ -219,6 +219,8 @@ class WalletService {
   private walletEndpoint: string | null = null;
   private _accountId: string | null = null;
   private _networkId: string = DEFAULT_NODE.networkId;
+  /** Endpoint last requested through setNode; what ensureWallet rebuilds against. */
+  private nodeSettings: NodeSettings = DEFAULT_NODE;
   /** The account address found to be mining, so the sweep runs once — see `holderReward`. */
   private holderRewardAddress: string | null = null;
 
@@ -1563,23 +1565,17 @@ class WalletService {
     // the shared WASM state.
     if (this.wallet && this.walletEndpoint === endpoint && !this.isOpen) {
       this._networkId = settings.networkId;
+      this.nodeSettings = settings;
       return;
     }
     if (this.isOpen) {
       await this.lock();
     }
     this._networkId = settings.networkId;
-    // Drop the old wallet before building the new one, so the two never coexist. lock() already
-    // stopped it when a wallet was open; this covers the closed case.
-    const previous = this.wallet;
+    this.nodeSettings = settings;
+    // lock() already stopped an open wallet, and a closed one was never started: stopping it
+    // again never returns.
     this.wallet = null;
-    if (previous) {
-      try {
-        await previous.stop();
-      } catch {
-        /* not started, or already stopped — nothing to unwind */
-      }
-    }
     this.buildWallet(settings);
     this.emit();
   }
@@ -3486,7 +3482,7 @@ class WalletService {
   private ensureWallet() {
     if (!this.wasmReady) throw new Error("WASM not initialized");
     if (!this.wallet) {
-      this.buildWallet(DEFAULT_NODE);
+      this.buildWallet(this.nodeSettings);
     }
   }
 
