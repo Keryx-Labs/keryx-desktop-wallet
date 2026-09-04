@@ -2386,6 +2386,8 @@ class WalletService {
       prompt: string;
       maxTokens: number;
       priorityFeeSompi?: bigint;
+      /** Keep the request off the public inference feed (self-send marker output). */
+      isPrivate?: boolean;
     },
   ): Promise<{
     txId: string;
@@ -2452,7 +2454,7 @@ class WalletService {
           inferenceReward: rewardSompi,
           priorityFee: feeSompi,
           currentDaaScore: this.nodeDaa ?? 0n,
-          isPrivate: false,
+          isPrivate: req.isPrivate ?? false,
         }),
       );
       // Keys as HEX STRINGS, not PrivateKey instances (packaged-build wasm-bindgen quirk).

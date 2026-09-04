@@ -6,8 +6,10 @@ import {
   ModelName,
   computeInferenceReward,
   MIN_AI_REQUEST_PRIORITY_FEE,
+  PRIVATE_MARKER_SOMPI,
 } from "../lib/aiRequest";
 import { fetchAnswerText } from "../lib/aiResponse";
+import { Select } from "../components/Select";
 
 const TOKEN_PRESETS = [128, 256, 512] as const;
 const DEFAULT_MODEL: ModelName = "qwen3.5-9b-abliterated";
@@ -22,8 +24,18 @@ const MODEL_ORDER: ModelName[] = [
   "kimi-linear-48b",
 ];
 
+type Visibility = "public" | "private";
+const VISIBILITY_KEY = "keryx.chat.visibility";
+function loadVisibility(): Visibility {
+  try {
+    return localStorage.getItem(VISIBILITY_KEY) === "private" ? "private" : "public";
+  } catch {
+    return "public";
+  }
+}
+
 type ChatMessage =
-  | { role: "user"; text: string; model: ModelName; totalSompi: bigint }
+  | { role: "user"; text: string; model: ModelName; totalSompi: bigint; isPrivate: boolean }
   | {
       role: "assistant";
       status: "pending" | "submitted" | "answered" | "error";
@@ -47,6 +59,15 @@ export function Chat({ onClose }: { onClose: () => void }) {
 
   const [model, setModel] = useState<ModelName>(DEFAULT_MODEL);
   const [maxTokens, setMaxTokens] = useState<number>(DEFAULT_MAX_TOKENS);
+  const [visibility, setVisibility] = useState<Visibility>(loadVisibility);
+  useEffect(() => {
+    try {
+      localStorage.setItem(VISIBILITY_KEY, visibility);
+    } catch {
+      /* per-viewer convenience only */
+    }
+  }, [visibility]);
+  const isPrivate = visibility === "private";
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [busy, setBusy] = useState(false);
@@ -137,7 +158,8 @@ export function Chat({ onClose }: { onClose: () => void }) {
   const totalSompi = rewardSompi + feeSompi;
 
   const connected = w.conn === "connected" && w.synced;
-  const hasFunds = w.balance.mature > totalSompi;
+  // The private marker is a self-send, so it must be funded even though it comes back.
+  const hasFunds = w.balance.mature > totalSompi + (isPrivate ? PRIVATE_MARKER_SOMPI : 0n);
   const canSend =
     connected &&
     hasFunds &&
@@ -150,11 +172,12 @@ export function Chat({ onClose }: { onClose: () => void }) {
     const text = prompt.trim();
     const model_ = model;
     const maxTokens_ = maxTokens;
+    const isPrivate_ = isPrivate;
     const cost = totalSompi;
     setPrompt("");
     setMessages((m) => [
       ...m,
-      { role: "user", text, model: model_, totalSompi: cost },
+      { role: "user", text, model: model_, totalSompi: cost, isPrivate: isPrivate_ },
       { role: "assistant", status: "pending", txId: null },
     ]);
     setBusy(true);
@@ -171,6 +194,7 @@ export function Chat({ onClose }: { onClose: () => void }) {
         model: model_,
         prompt: text,
         maxTokens: maxTokens_,
+        isPrivate: isPrivate_,
       });
       setMessages((m) =>
         replaceLastAssistant(m, {
@@ -212,42 +236,48 @@ export function Chat({ onClose }: { onClose: () => void }) {
       {/* controls: model + token budget */}
       <div className="flex flex-wrap items-end gap-3 border-b border-keryx-border px-5 py-3">
         <label className="min-w-[12rem] flex-1">
-          <span className="label">Model</span>
-          <select
-            className="input"
+          <span className="label text-keryx-green">Model</span>
+          <Select
             value={model}
-            onChange={(e) => setModel(e.target.value as ModelName)}
+            onChange={setModel}
             disabled={busy}
-          >
-            {MODEL_ORDER.map((k) => (
-              <option key={k} value={k}>
-                {MODELS[k].label}
-                {caps ? ` · ${minersFor(k)} miner${minersFor(k) === 1 ? "" : "s"}` : ""}
-              </option>
-            ))}
-          </select>
+            options={MODEL_ORDER.map((k) => ({
+              value: k,
+              label:
+                MODELS[k].label +
+                (caps ? ` · ${minersFor(k)} miner${minersFor(k) === 1 ? "" : "s"}` : ""),
+            }))}
+          />
         </label>
         <label>
-          <span className="label">Max tokens</span>
-          <select
-            className="input"
-            value={maxTokens}
-            onChange={(e) => setMaxTokens(Number(e.target.value))}
+          <span className="label text-keryx-green">Max tokens</span>
+          <Select
+            value={String(maxTokens)}
+            onChange={(v) => setMaxTokens(Number(v))}
             disabled={busy}
-          >
-            {TOKEN_PRESETS.map((t) => (
-              <option key={t} value={t}>
-                {t}
-              </option>
-            ))}
-          </select>
+            options={TOKEN_PRESETS.map((t) => ({ value: String(t), label: String(t) }))}
+          />
+        </label>
+        <label
+          title="Private keeps the request off the public inference feed on the explorer. It is not encryption: prompt and answer stay readable on-chain. Costs nothing extra (a 0.5 KRX self-send that comes back to you)."
+        >
+          <span className="label text-keryx-green">Visibility</span>
+          <Select
+            value={visibility}
+            onChange={setVisibility}
+            disabled={busy}
+            options={[
+              { value: "public", label: "Public feed" },
+              { value: "private", label: "Private" },
+            ]}
+          />
         </label>
       </div>
 
       {activeMiners !== null && (
         <div
           className={`border-b border-keryx-border px-5 py-2 font-mono text-[11px] ${
-            activeMiners > 0 ? "text-keryx-dim" : "text-keryx-error"
+            activeMiners > 0 ? "text-keryx-green" : "text-keryx-error"
           }`}
         >
           {activeMiners > 0
@@ -326,6 +356,7 @@ function Bubble({ msg }: { msg: ChatMessage }) {
           <p className="whitespace-pre-wrap text-sm text-emerald-50">{msg.text}</p>
           <p className="mt-1 text-right text-[10px] text-emerald-200/40">
             {MODELS[msg.model].label} · {formatKrx(msg.totalSompi)} KRX
+            {msg.isPrivate ? " · private" : ""}
           </p>
         </div>
       </div>
