@@ -1497,6 +1497,7 @@ class WalletService {
     if (!r) return null;
     const productionRaw = r.is_miner ? jsonBig(r.production_24h_sompi) : 0n;
     const next = r.next_bracket as Record<string, unknown> | null | undefined;
+    const income = r.income as Record<string, unknown> | null | undefined;
     return {
       address,
       virtualDaaScore: jsonBig(r.tip_daa),
@@ -1509,14 +1510,16 @@ class WalletService {
       fullBracketBalance: jsonBig(r.full_bracket_balance_sompi),
       windowDaa: jsonBig(r.window_daa),
       active: true,
-      // Income split (paid / burned / escrow / inference / tier mix) is not served yet; the panel
-      // hides those rows while `incomeWindowDaa` is 0n.
-      paid: 0n,
-      burned: 0n,
-      escrow: 0n,
-      inference: 0n,
-      incomeWindowDaa: 0n,
-      tierBase: [],
+      // Income split from the explorer's coinbase index; the panel hides those rows while
+      // `incomeWindowDaa` is 0n (index younger than one block, or not served).
+      paid: income ? jsonBig(income.paid_sompi) : 0n,
+      burned: income ? jsonBig(income.burned_sompi) : 0n,
+      escrow: income ? jsonBig(income.escrow_sompi) : 0n,
+      inference: income ? jsonBig(income.inference_sompi) : 0n,
+      incomeWindowDaa: income ? jsonBig(income.income_window_daa) : 0n,
+      tierBase: income && Array.isArray(income.tier_base_sompi)
+        ? (income.tier_base_sompi as unknown[]).map((t) => jsonBig(t))
+        : [],
     };
   }
 
