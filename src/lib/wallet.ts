@@ -1968,9 +1968,12 @@ class WalletService {
   /** Backstop for the consolidate round loop. Each round divides the set by ~MAX_TX_INPUTS, so even
    *  250k UTXOs finish in 3 rounds; this only trips if the set inexplicably fails to shrink. */
   private static readonly MAX_CONSOLIDATE_ROUNDS = 12;
-  /** Safety cap on transactions per run, so a pathological set can't fire off unbounded txs (each
-   *  one costs KERYX_MIN_FEE). 250k UTXOs needs ~3.1k txs, so this leaves real headroom. */
+  /** Transactions per run. A larger set is swept over several runs: a round is trimmed to what is
+   *  left of this budget and the run stops once it is spent. */
   private static readonly MAX_CONSOLIDATE_TXS = 6000;
+  private static readonly RUN_TX_LIMIT_MESSAGE =
+    `Reached the limit of ${WalletService.MAX_CONSOLIDATE_TXS} transactions per run, stopping here. ` +
+    "Run Consolidate again to continue.";
   /** Concurrent submits in flight. Enough to keep the node busy without burying its RPC queue. */
   private static readonly SUBMIT_CONCURRENCY = 8;
   /** A getUtxosByAddresses over a huge set is slow but must not hang forever. */
@@ -2761,11 +2764,14 @@ class WalletService {
           if (chunk.length >= 2) chunks.push(chunk);
         }
         if (chunks.length === 0) break;
-        if (run.txsSubmitted + chunks.length > WalletService.MAX_CONSOLIDATE_TXS) {
-          throw new Error(
-            `This run would need more than ${WalletService.MAX_CONSOLIDATE_TXS} transactions. ` +
-              `Consolidate in stages instead.`
-          );
+        const txBudget = WalletService.MAX_CONSOLIDATE_TXS - run.txsSubmitted;
+        if (chunks.length > txBudget) {
+          chunks.length = Math.max(0, txBudget);
+          if (chunks.length === 0) {
+            run.lastError = WalletService.RUN_TX_LIMIT_MESSAGE;
+            run.phase = "stopped";
+            break;
+          }
         }
         // Never exceed the fee the user explicitly accepted. New UTXOs can arrive mid-run (mining
         // payouts) and previously-immature ones mature, so the up-front estimate is not a ceiling
@@ -2832,6 +2838,11 @@ class WalletService {
         run.remaining = remaining;
         this.emit();
         if (remaining < 2) break;
+        if (run.txsSubmitted >= WalletService.MAX_CONSOLIDATE_TXS) {
+          run.lastError = WalletService.RUN_TX_LIMIT_MESSAGE;
+          run.phase = "stopped";
+          break;
+        }
       }
 
       // Preserve a terminal state a break already set (fee budget exhausted → "stopped"); only a
@@ -3027,12 +3038,14 @@ class WalletService {
     utxoCount: number;
     txCount: number;
     rounds: number;
+    runs: number;
+    txsPerRun: number;
     feeSompi: bigint;
   }> {
     const { count } = await this.utxoStats();
     let txCount = 0;
     let remaining = count;
-    while (remaining > 1 && txCount <= WalletService.MAX_CONSOLIDATE_TXS) {
+    for (let r = 0; remaining > 1 && r < WalletService.MAX_CONSOLIDATE_ROUNDS; r++) {
       const txs = Math.floor(remaining / WalletService.MAX_TX_INPUTS);
       const tail = remaining % WalletService.MAX_TX_INPUTS;
       const thisRound = txs + (tail >= 2 ? 1 : 0);
@@ -3044,6 +3057,8 @@ class WalletService {
       utxoCount: count,
       txCount,
       rounds: WalletService.estimateRounds(count),
+      runs: Math.max(1, Math.ceil(txCount / WalletService.MAX_CONSOLIDATE_TXS)),
+      txsPerRun: WalletService.MAX_CONSOLIDATE_TXS,
       feeSompi: BigInt(txCount) * WalletService.KERYX_MIN_FEE,
     };
   }

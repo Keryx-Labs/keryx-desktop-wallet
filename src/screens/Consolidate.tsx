@@ -5,7 +5,14 @@ import { Modal } from "../components/Modal";
 import { ProgressBar, consolidateRunPercent } from "../components/ProgressBar";
 
 type Stats = { count: number; totalSompi: bigint };
-type Cost = { utxoCount: number; txCount: number; rounds: number; feeSompi: bigint };
+type Cost = {
+  utxoCount: number;
+  txCount: number;
+  rounds: number;
+  runs: number;
+  txsPerRun: number;
+  feeSompi: bigint;
+};
 
 // Consolidate (compound) UTXOs: sweeps many small UTXOs back to yourself in as few transactions as
 // the per-transaction input limit allows. Useful for miners with lots of small payouts.
@@ -281,6 +288,12 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
                   <dt>Rounds</dt>
                   <dd className="num">{cost.rounds}</dd>
                 </div>
+                {cost.runs > 1 && (
+                  <div className="flex justify-between">
+                    <dt>Runs</dt>
+                    <dd className="num">{cost.runs}</dd>
+                  </div>
+                )}
                 <div className="flex justify-between border-t border-keryx-warn/30 pt-1 font-semibold">
                   <dt>Total network fee</dt>
                   <dd className="num">{formatKrx(cost.feeSompi)} KRX</dd>
@@ -291,6 +304,12 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
                 be lower. Each transaction pays the network minimum, and the count is set by the
                 per-transaction input limit, not by us.
               </p>
+              {cost.runs > 1 && (
+                <p className="mt-2 text-[10px] leading-relaxed text-keryx-warn/70">
+                  Each run sends at most {cost.txsPerRun} transactions, then stops. Run Consolidate
+                  again to continue; you can stop after any run.
+                </p>
+              )}
               <label className="mt-3 flex cursor-pointer items-start gap-2 text-[11px] text-keryx-warn">
                 <input
                   type="checkbox"
