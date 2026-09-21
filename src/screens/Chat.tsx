@@ -7,6 +7,9 @@ import {
   computeInferenceReward,
   MIN_AI_REQUEST_PRIORITY_FEE,
   PRIVATE_MARKER_SOMPI,
+  h14ActivationDaa,
+  networkModelFor,
+  type AiAvailability,
 } from "../lib/aiRequest";
 import { fetchAnswerText } from "../lib/aiResponse";
 import { Select } from "../components/Select";
@@ -16,7 +19,7 @@ const DEFAULT_MODEL: ModelName = "qwen3.5-9b-abliterated";
 const CAPS_POLL_MS = 30_000;
 const DEFAULT_MAX_TOKENS = 256;
 
-const MODEL_ORDER: ModelName[] = [
+const LINEUP_H6: ModelName[] = [
   "qwen3.5-9b-abliterated",
   "glm-4-9b-0414",
   "gemma-4-12b-abliterated",
@@ -73,9 +76,14 @@ export function Chat({ onClose }: { onClose: () => void }) {
   const [busy, setBusy] = useState(false);
   // Active miners per model_id hex (explorer API, last 20 min); null until the first answer.
   const [caps, setCaps] = useState<Map<string, number> | null>(null);
+  // Network-model availability (H14, explorer API); null until the first answer.
+  const [availability, setAvailability] = useState<AiAvailability | null>(null);
   useEffect(() => {
     let alive = true;
-    const load = () => void wallet.fetchCapabilities().then((c) => alive && c && setCaps(c));
+    const load = () => {
+      void wallet.fetchCapabilities().then((c) => alive && c && setCaps(c));
+      void wallet.fetchAiAvailability().then((a) => alive && a && setAvailability(a));
+    };
     load();
     const id = setInterval(load, CAPS_POLL_MS);
     return () => {
@@ -83,8 +91,26 @@ export function Chat({ onClose }: { onClose: () => void }) {
       clearInterval(id);
     };
   }, [w.networkId]);
+  // Past H14 the lineup is paused: the network model is the only servable target.
+  const networkModel = networkModelFor(w.networkId);
+  const h14Active = w.nodeDaa != null && BigInt(w.nodeDaa) >= h14ActivationDaa(w.networkId);
+  const modelOrder: ModelName[] = h14Active ? [networkModel] : LINEUP_H6;
+  useEffect(() => {
+    if (!modelOrder.includes(model)) setModel(modelOrder[0]);
+  }, [h14Active]);
+  const networkModelSelected = h14Active && model === networkModel;
+  const missingShard = availability?.shards.find((s) => s.producers === 0) ?? null;
   const minersFor = (k: ModelName) => caps?.get(MODELS[k].modelIdHex) ?? 0;
-  const activeMiners = caps ? minersFor(model) : null;
+  // Network model: the thinnest shard decides.
+  const activeMiners = networkModelSelected
+    ? availability
+      ? availability.shards.length > 0
+        ? Math.min(...availability.shards.map((s) => s.producers))
+        : 0
+      : null
+    : caps
+      ? minersFor(model)
+      : null;
 
   const scrollRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -165,7 +191,10 @@ export function Chat({ onClose }: { onClose: () => void }) {
     hasFunds &&
     !busy &&
     wallet.isOpen &&
-    prompt.trim().length > 0;
+    prompt.trim().length > 0 &&
+    // devnet has no explorer API, so availability stays unknown there; the node's mempool
+    // still refuses a request no shard tier can serve.
+    (!networkModelSelected || availability?.available === true || w.networkId === "devnet");
 
   async function send() {
     if (!canSend) return;
@@ -182,12 +211,24 @@ export function Chat({ onClose }: { onClose: () => void }) {
     ]);
     setBusy(true);
     try {
-      // 1) check that a miner is serving this model (wRPC coinbase scan)
-      const providers = await wallet.fetchModelEscrowPubkeys(MODELS[model_].modelIdHex);
-      if (providers.length === 0) {
-        throw new Error(
-          "No miner is currently serving this model. Try another model.",
-        );
+      // 1) check that the model can be served: every shard has a miner (network model), or a
+      //    miner advertises the model in its coinbase (lineup)
+      if (networkModelSelected) {
+        const a = await wallet.fetchAiAvailability();
+        if (!a) throw new Error("Could not check the shard miners. Try again in a moment.");
+        if (!a.available) {
+          const missing = a.shards.find((s) => s.producers === 0);
+          throw new Error(
+            `The network model cannot be assembled: no miner holds shard tier ${missing?.tier ?? "?"}. Try again later.`,
+          );
+        }
+      } else {
+        const providers = await wallet.fetchModelEscrowPubkeys(MODELS[model_].modelIdHex);
+        if (providers.length === 0) {
+          throw new Error(
+            "No miner is currently serving this model. Try another model.",
+          );
+        }
       }
       // 2) build + sign + submit the AiRequest
       const { txId, requestHashHex, cursorHash } = await wallet.submitInference({
@@ -241,11 +282,17 @@ export function Chat({ onClose }: { onClose: () => void }) {
             value={model}
             onChange={setModel}
             disabled={busy}
-            options={MODEL_ORDER.map((k) => ({
+            options={modelOrder.map((k) => ({
               value: k,
               label:
                 MODELS[k].label +
-                (caps ? ` · ${minersFor(k)} miner${minersFor(k) === 1 ? "" : "s"}` : ""),
+                (h14Active && k === networkModel
+                  ? availability
+                    ? ` · ${availability.available ? "available" : "unavailable"}`
+                    : ""
+                  : caps
+                    ? ` · ${minersFor(k)} miner${minersFor(k) === 1 ? "" : "s"}`
+                    : ""),
             }))}
           />
         </label>
@@ -274,7 +321,7 @@ export function Chat({ onClose }: { onClose: () => void }) {
         </label>
       </div>
 
-      {activeMiners !== null && (
+      {activeMiners !== null && !networkModelSelected && (
         <div
           className={`border-b border-keryx-border px-5 py-2 font-mono text-[11px] ${
             activeMiners > 0 ? "text-keryx-green" : "text-keryx-error"
@@ -283,6 +330,24 @@ export function Chat({ onClose }: { onClose: () => void }) {
           {activeMiners > 0
             ? `${activeMiners} active miner${activeMiners > 1 ? "s" : ""} for this model`
             : `⚠ No active miners for ${MODELS[model].label} in the last 20 minutes.`}
+        </div>
+      )}
+      {networkModelSelected && availability && (
+        <div
+          className={`flex flex-wrap gap-x-3 gap-y-1 border-b border-keryx-border px-5 py-2 font-mono text-[11px] ${
+            availability.available ? "text-keryx-green" : "text-keryx-error"
+          }`}
+        >
+          <span>
+            {availability.available
+              ? `${availability.shards.length} shards, one miner each per request`
+              : `⚠ No miner holds shard tier ${missingShard?.tier ?? "?"} — the model cannot be assembled.`}
+          </span>
+          {availability.shards.map((s) => (
+            <span key={s.tier} className={s.producers > 0 ? "text-keryx-dim" : "text-keryx-error"}>
+              tier {s.tier} · {s.vramGb} GB · {s.producers} miner{s.producers === 1 ? "" : "s"}
+            </span>
+          ))}
         </div>
       )}
 

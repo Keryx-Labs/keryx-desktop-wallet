@@ -6,6 +6,7 @@ import wasmUrl from "../sdk/kaspa_bg.wasm?url";
 import {
   buildAiRequestTx,
   computeInferenceReward,
+  type AiAvailability,
   MODELS,
   ModelName,
   RequestUtxo,
@@ -99,6 +100,7 @@ const ESCROW_DELEGATION_DOMAIN = "KeryxEscrowDelegationV1";
 export const DEFAULT_NODES: Record<string, NodeSettings> = {
   mainnet: { url: "wss://node.keryx-labs.com:23110", networkId: "mainnet" },
   "testnet-10": { url: "wss://node.keryx-labs.com:23210", networkId: "testnet-10" },
+  devnet: { url: "ws://127.0.0.1:23610", networkId: "devnet" },
 };
 
 export const DEFAULT_NODE: NodeSettings = DEFAULT_NODES.mainnet;
@@ -1481,6 +1483,27 @@ class WalletService {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Network-model availability (H14) from the explorer API: eligible producers per shard tier.
+   * Null when the API did not answer.
+   */
+  async fetchAiAvailability(): Promise<AiAvailability | null> {
+    const r = await this.explorerGet("/api/v1/ai/availability", "ai availability");
+    if (!r) return null;
+    const shards = Array.isArray(r.shards) ? (r.shards as Array<Record<string, unknown>>) : [];
+    return {
+      virtualDaaScore: jsonBig(r.virtual_daa_score),
+      modelIdHex: String(r.model_id_hex ?? "").toLowerCase(),
+      active: r.active === true,
+      available: r.available === true,
+      shards: shards.map((s) => ({
+        tier: Number(s.tier ?? 0),
+        vramGb: Number(s.vram_gb ?? 0),
+        producers: Number(s.producers ?? 0),
+      })),
+    };
   }
 
   /**

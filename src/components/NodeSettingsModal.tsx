@@ -161,6 +161,7 @@ export function NodeSettingsModal({
           options={[
             { value: "mainnet", label: "mainnet" },
             { value: "testnet-10", label: "testnet-10" },
+            { value: "devnet", label: "devnet (local bench)" },
             { value: "simnet", label: "simnet" },
           ]}
         />

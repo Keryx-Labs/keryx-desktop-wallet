@@ -65,8 +65,8 @@ const COINBASE_MATURITY = 1000;
 export const PRIVATE_MARKER_SOMPI = 50_000_000n; // 0.5 KRX, self-send (reclaimable)
 
 // ---------------------------------------------------------------------------
-// Model registry (H6 lineup, tiers 0..4) — model_id + base inference_reward.
-// Values verified against INFERENCE_REWARD_MINIMUMS_V2_H6 in the node params.
+// Model registry (H6 lineup, tiers 0..4, plus the H14 network model) — model_id + base
+// inference_reward. Values verified against INFERENCE_REWARD_MINIMUMS_V2_H14 in the node params.
 // ---------------------------------------------------------------------------
 
 export type ModelName =
@@ -74,7 +74,8 @@ export type ModelName =
   | "glm-4-9b-0414"
   | "gemma-4-12b-abliterated"
   | "qwen3.6-27b"
-  | "kimi-linear-48b";
+  | "kimi-linear-48b"
+  | "deepseek-v4-flash";
 
 export interface ModelInfo {
   modelIdHex: string;
@@ -108,7 +109,40 @@ export const MODELS: Record<ModelName, ModelInfo> = {
     baseRewardSompi: 400_000_000n, // 4.0 KRX
     label: "Kimi-Linear-48B (uncensored)",
   },
+  "deepseek-v4-flash": {
+    modelIdHex: "918570a84e9e18322110170332f80a9225e078ca7fc7b54fcda3a7f45ab65810",
+    baseRewardSompi: 400_000_000n, // 4.0 KRX, shared by the six shard miners
+    label: "DeepSeek-V4-Flash (uncensored, 6 shards)",
+  },
 };
+
+// H14 (model split). Mirrors the node's `model_split_activation`: past it the lineup is paused
+// and the network model is the only servable target. Mainnet not scheduled yet.
+export function h14ActivationDaa(networkId: string): bigint {
+  if (networkId === "devnet") return 500n;
+  return networkId === "mainnet" ? BigInt(Number.MAX_SAFE_INTEGER) : 133_000n;
+}
+
+/** The network model: split V4-Flash, or the two-shard 9B bench on devnet. */
+export function networkModelFor(networkId: string): ModelName {
+  return networkId === "devnet" ? "qwen3.5-9b-abliterated" : "deepseek-v4-flash";
+}
+
+/** Eligible producers of one shard tier of the network model, from the explorer API. */
+export interface ShardAvailability {
+  tier: number;
+  vramGb: number;
+  producers: number;
+}
+
+/** Whether the network can assemble its model right now: every shard tier needs a producer. */
+export interface AiAvailability {
+  virtualDaaScore: bigint;
+  modelIdHex: string;
+  active: boolean;
+  available: boolean;
+  shards: ShardAvailability[];
+}
 
 /** effective inference_reward minimum = base + ceil(max_tokens/64) * TOKEN_STEP. */
 export function computeInferenceReward(baseSompi: bigint, maxTokens: number): bigint {
