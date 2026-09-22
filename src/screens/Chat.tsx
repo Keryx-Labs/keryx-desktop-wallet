@@ -12,6 +12,16 @@ import {
   type AiAvailability,
 } from "../lib/aiRequest";
 import { fetchAnswerText } from "../lib/aiResponse";
+import {
+  MAX_PROMPT_BYTES,
+  composePrompt,
+  conversationKey,
+  loadConversation,
+  loadMemoryEnabled,
+  saveConversation,
+  saveMemoryEnabled,
+  type Exchange,
+} from "../lib/chatMemory";
 import { Select } from "../components/Select";
 
 const TOKEN_PRESETS = [128, 256, 512] as const;
@@ -38,7 +48,15 @@ function loadVisibility(): Visibility {
 }
 
 type ChatMessage =
-  | { role: "user"; text: string; model: ModelName; totalSompi: bigint; isPrivate: boolean }
+  | {
+      role: "user";
+      text: string;
+      model: ModelName;
+      totalSompi: bigint;
+      isPrivate: boolean;
+      /** Earlier exchanges sent along with this message. */
+      context?: number;
+    }
   | {
       role: "assistant";
       status: "pending" | "submitted" | "answered" | "error";
@@ -57,6 +75,51 @@ type ChatMessage =
 const POLL_MS = 6000;
 const MAX_POLLS = 50;
 
+function exchangesOf(msgs: ChatMessage[]): Exchange[] {
+  const out: Exchange[] = [];
+  for (let i = 0; i + 1 < msgs.length; i++) {
+    const q = msgs[i];
+    const a = msgs[i + 1];
+    if (q.role === "user" && a.role === "assistant" && a.status === "answered" && a.answerText) {
+      out.push({ question: q.text, answer: a.answerText.trim() });
+    }
+  }
+  return out;
+}
+
+function reviveMessage(raw: unknown): ChatMessage | null {
+  if (!raw || typeof raw !== "object") return null;
+  const m = raw as Record<string, unknown>;
+  if (m.role === "user" && typeof m.text === "string" && typeof m.model === "string") {
+    return {
+      role: "user",
+      text: m.text,
+      model: m.model as ModelName,
+      totalSompi: BigInt(typeof m.totalSompi === "string" ? m.totalSompi : 0),
+      isPrivate: m.isPrivate === true,
+      context: typeof m.context === "number" ? m.context : undefined,
+    };
+  }
+  if (m.role === "assistant" && typeof m.status === "string") {
+    const a = m as unknown as Extract<ChatMessage, { role: "assistant" }>;
+    if (a.status === "pending") {
+      return {
+        role: "assistant",
+        status: "error",
+        txId: null,
+        note: "Interrupted while sending. Check your transaction history before asking again.",
+      };
+    }
+    // A reopened chat resumes watching from the stored cursor.
+    return a.status === "submitted" ? { ...a, attempts: 0 } : a;
+  }
+  return null;
+}
+
+function formatKb(bytes: number): string {
+  return (bytes / 1000).toFixed(1);
+}
+
 export function Chat({ onClose }: { onClose: () => void }) {
   const w = useWalletState();
 
@@ -71,8 +134,22 @@ export function Chat({ onClose }: { onClose: () => void }) {
     }
   }, [visibility]);
   const isPrivate = visibility === "private";
+  const [memoryOn, setMemoryOn] = useState<boolean>(loadMemoryEnabled);
+  useEffect(() => saveMemoryEnabled(memoryOn), [memoryOn]);
   const [prompt, setPrompt] = useState("");
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const convKey = conversationKey(w.networkId, w.receiveAddresses[0] ?? null);
+  const [messages, setMessages] = useState<ChatMessage[]>(() =>
+    loadConversation(convKey, reviveMessage),
+  );
+  const loadedKey = useRef(convKey);
+  useEffect(() => {
+    if (loadedKey.current === convKey) return;
+    loadedKey.current = convKey;
+    setMessages(loadConversation(convKey, reviveMessage));
+  }, [convKey]);
+  useEffect(() => {
+    saveConversation(loadedKey.current, messages);
+  }, [messages]);
   const [busy, setBusy] = useState(false);
   // Active miners per model_id hex (explorer API, last 20 min); null until the first answer.
   const [caps, setCaps] = useState<Map<string, number> | null>(null);
@@ -145,7 +222,7 @@ export function Chat({ onClose }: { onClose: () => void }) {
               ),
             );
             // Fetch + render the answer inline (escaped text) from our IPFS gateway.
-            fetchAnswerText(result.cidV0)
+            fetchAnswerText(result.cidV0, wallet.ipfsGateway)
               .then((text) =>
                 setMessages((cur) =>
                   cur.map((x) =>
@@ -183,6 +260,10 @@ export function Chat({ onClose }: { onClose: () => void }) {
   const feeSompi = MIN_AI_REQUEST_PRIORITY_FEE;
   const totalSompi = rewardSompi + feeSompi;
 
+  const history = memoryOn ? exchangesOf(messages) : [];
+  const preview = composePrompt(history, prompt.trim());
+  const tooLong = preview.bytes > MAX_PROMPT_BYTES;
+
   const connected = w.conn === "connected" && w.synced;
   // The private marker is a self-send, so it must be funded even though it comes back.
   const hasFunds = w.balance.mature > totalSompi + (isPrivate ? PRIVATE_MARKER_SOMPI : 0n);
@@ -192,6 +273,7 @@ export function Chat({ onClose }: { onClose: () => void }) {
     !busy &&
     wallet.isOpen &&
     prompt.trim().length > 0 &&
+    !tooLong &&
     // devnet has no explorer API, so availability stays unknown there; the node's mempool
     // still refuses a request no shard tier can serve.
     (!networkModelSelected || availability?.available === true || w.networkId === "devnet");
@@ -199,6 +281,7 @@ export function Chat({ onClose }: { onClose: () => void }) {
   async function send() {
     if (!canSend) return;
     const text = prompt.trim();
+    const composed = composePrompt(memoryOn ? exchangesOf(messages) : [], text);
     const model_ = model;
     const maxTokens_ = maxTokens;
     const isPrivate_ = isPrivate;
@@ -206,14 +289,21 @@ export function Chat({ onClose }: { onClose: () => void }) {
     setPrompt("");
     setMessages((m) => [
       ...m,
-      { role: "user", text, model: model_, totalSompi: cost, isPrivate: isPrivate_ },
+      {
+        role: "user",
+        text,
+        model: model_,
+        totalSompi: cost,
+        isPrivate: isPrivate_,
+        context: composed.used,
+      },
       { role: "assistant", status: "pending", txId: null },
     ]);
     setBusy(true);
     try {
       // 1) check that the model can be served: every shard has a miner (network model), or a
       //    miner advertises the model in its coinbase (lineup)
-      if (networkModelSelected) {
+      if (networkModelSelected && w.networkId !== "devnet") {
         const a = await wallet.fetchAiAvailability();
         if (!a) throw new Error("Could not check the shard miners. Try again in a moment.");
         if (!a.available) {
@@ -222,7 +312,7 @@ export function Chat({ onClose }: { onClose: () => void }) {
             `The network model cannot be assembled: no miner holds shard tier ${missing?.tier ?? "?"}. Try again later.`,
           );
         }
-      } else {
+      } else if (!networkModelSelected) {
         const providers = await wallet.fetchModelEscrowPubkeys(MODELS[model_].modelIdHex);
         if (providers.length === 0) {
           throw new Error(
@@ -233,7 +323,7 @@ export function Chat({ onClose }: { onClose: () => void }) {
       // 2) build + sign + submit the AiRequest
       const { txId, requestHashHex, cursorHash } = await wallet.submitInference({
         model: model_,
-        prompt: text,
+        prompt: composed.prompt,
         maxTokens: maxTokens_,
         isPrivate: isPrivate_,
       });
@@ -269,9 +359,19 @@ export function Chat({ onClose }: { onClose: () => void }) {
           <h2 className="text-lg font-bold text-keryx-green">Inference</h2>
           <p className="text-xs text-emerald-200/50">Ask the Keryx network</p>
         </div>
-        <button className="btn-ghost px-3 py-1.5 text-xs" onClick={onClose}>
-          Close
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            className="btn-ghost px-3 py-1.5 text-xs"
+            onClick={() => setMessages([])}
+            disabled={busy || messages.length === 0}
+            title="Start over: earlier messages are no longer sent along."
+          >
+            New conversation
+          </button>
+          <button className="btn-ghost px-3 py-1.5 text-xs" onClick={onClose}>
+            Close
+          </button>
+        </div>
       </header>
 
       {/* controls: model + token budget */}
@@ -316,6 +416,20 @@ export function Chat({ onClose }: { onClose: () => void }) {
             options={[
               { value: "public", label: "Public feed" },
               { value: "private", label: "Private" },
+            ]}
+          />
+        </label>
+        <label
+          title="Memory sends your earlier exchanges along with each new message, so the model can build on them. They go on-chain inside the prompt, like the message itself. Costs nothing extra; up to 4 KB per request, the most recent exchanges first."
+        >
+          <span className="label text-keryx-green">Memory</span>
+          <Select
+            value={memoryOn ? "on" : "off"}
+            onChange={(v) => setMemoryOn(v === "on")}
+            disabled={busy}
+            options={[
+              { value: "on", label: "On" },
+              { value: "off", label: "Off" },
             ]}
           />
         </label>
@@ -398,6 +512,19 @@ export function Chat({ onClose }: { onClose: () => void }) {
             {busy ? "Sending…" : "Send"}
           </button>
         </div>
+        {memoryOn && history.length > 0 && !tooLong && (
+          <p className="mt-2 font-mono text-[11px] text-emerald-200/40">
+            context: {preview.used} of {history.length} earlier exchange
+            {history.length === 1 ? "" : "s"}
+            {preview.truncated ? " (oldest cut)" : ""} · {formatKb(preview.bytes)} /{" "}
+            {formatKb(MAX_PROMPT_BYTES)} KB
+          </p>
+        )}
+        {tooLong && (
+          <p className="mt-2 text-xs text-amber-300/80">
+            Message too long: {formatKb(preview.bytes)} / {formatKb(MAX_PROMPT_BYTES)} KB.
+          </p>
+        )}
         {!connected && (
           <p className="mt-2 text-xs text-amber-300/80">
             Not connected / synced — requests are disabled.
@@ -420,8 +547,9 @@ function Bubble({ msg }: { msg: ChatMessage }) {
         <div className="max-w-[80%] rounded-2xl rounded-br-sm border border-keryx-green/30 bg-keryx-green/10 px-4 py-2">
           <p className="whitespace-pre-wrap text-sm text-emerald-50">{msg.text}</p>
           <p className="mt-1 text-right text-[10px] text-emerald-200/40">
-            {MODELS[msg.model].label} · {formatKrx(msg.totalSompi)} KRX
+            {MODELS[msg.model]?.label ?? msg.model} · {formatKrx(msg.totalSompi)} KRX
             {msg.isPrivate ? " · private" : ""}
+            {msg.context ? ` · + ${msg.context} earlier exchange${msg.context === 1 ? "" : "s"}` : ""}
           </p>
         </div>
       </div>
