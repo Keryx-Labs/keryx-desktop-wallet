@@ -19,6 +19,7 @@ import {
   parseAiResponse,
   ipfsUrl,
   SUBNETWORK_ID_AI_RESPONSE_HEX,
+  PUBLIC_IPFS_GATEWAY,
 } from "./aiResponse";
 
 const WALLET_FILENAME = "main";
@@ -1464,6 +1465,8 @@ class WalletService {
    * did not answer.
    */
   async fetchCapabilities(): Promise<Map<string, number> | null> {
+    // devnet has no explorer API; the testnet one would answer about another chain.
+    if (this._networkId === "devnet") return null;
     try {
       const res = await this.withTimeout(
         fetch(`${explorerApiBase(this._networkId)}/api/v1/capabilities`),
@@ -1490,6 +1493,7 @@ class WalletService {
    * Null when the API did not answer.
    */
   async fetchAiAvailability(): Promise<AiAvailability | null> {
+    if (this._networkId === "devnet") return null;
     const r = await this.explorerGet("/api/v1/ai/availability", "ai availability");
     if (!r) return null;
     const shards = Array.isArray(r.shards) ? (r.shards as Array<Record<string, unknown>>) : [];
@@ -2469,6 +2473,11 @@ class WalletService {
    * result CID + gateway URL once found, and an advanced cursor to resume from on
    * the next poll. wRPC-only — the answer TEXT itself lives on IPFS (open the URL).
    */
+  /** Devnet answers only exist on the bench miner's own IPFS node. */
+  get ipfsGateway(): string {
+    return this._networkId === "devnet" ? "http://127.0.0.1:8080" : PUBLIC_IPFS_GATEWAY;
+  }
+
   async pollInferenceResult(
     requestHashHex: string,
     cursorHash: string,
@@ -2497,7 +2506,7 @@ class WalletService {
           const parsed = parseAiResponse(tx.payload);
           if (parsed && parsed.requestHashHex.toLowerCase() === target) {
             return {
-              result: { cidV0: parsed.cidV0, url: ipfsUrl(parsed.cidV0) },
+              result: { cidV0: parsed.cidV0, url: ipfsUrl(parsed.cidV0, this.ipfsGateway) },
               cursorHash: cursor,
             };
           }

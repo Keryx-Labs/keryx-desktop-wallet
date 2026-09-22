@@ -75,7 +75,8 @@ export type ModelName =
   | "gemma-4-12b-abliterated"
   | "qwen3.6-27b"
   | "kimi-linear-48b"
-  | "deepseek-v4-flash";
+  | "deepseek-v4-flash"
+  | "split9b-bench";
 
 export interface ModelInfo {
   modelIdHex: string;
@@ -109,6 +110,12 @@ export const MODELS: Record<ModelName, ModelInfo> = {
     baseRewardSompi: 400_000_000n, // 4.0 KRX
     label: "Kimi-Linear-48B (uncensored)",
   },
+  // devnet bench only: the 9B split in two shards (node SPLIT9B_WHOLE_MODEL_ID).
+  "split9b-bench": {
+    modelIdHex: "1f22b2133c40b16d0ba15dffb4823f889b76eb834fe6c90dedc6a38d504a46cb",
+    baseRewardSompi: 100_000_000n, // 1.0 KRX, shared by the two shard miners
+    label: "Qwen3.5-9B bench (2 shards)",
+  },
   "deepseek-v4-flash": {
     modelIdHex: "918570a84e9e18322110170332f80a9225e078ca7fc7b54fcda3a7f45ab65810",
     baseRewardSompi: 400_000_000n, // 4.0 KRX, shared by the six shard miners
@@ -125,7 +132,7 @@ export function h14ActivationDaa(networkId: string): bigint {
 
 /** The network model: split V4-Flash, or the two-shard 9B bench on devnet. */
 export function networkModelFor(networkId: string): ModelName {
-  return networkId === "devnet" ? "qwen3.5-9b-abliterated" : "deepseek-v4-flash";
+  return networkId === "devnet" ? "split9b-bench" : "deepseek-v4-flash";
 }
 
 /** Eligible producers of one shard tier of the network model, from the explorer API. */
