@@ -55,7 +55,10 @@ export function parseAiResponse(
   } catch {
     return null;
   }
-  if (bytes.length !== 78 && bytes.length !== 174) return null;
+  // V3 (model split) appends [n_links][tier + escrow pubkey + signature] × n to the v2 bytes.
+  const isV3 =
+    bytes.length > 174 && bytes[174] > 0 && bytes.length === 175 + bytes[174] * 97;
+  if (bytes.length !== 78 && bytes.length !== 142 && bytes.length !== 174 && !isV3) return null;
   const cid = bytes.subarray(40, 74); // 34-byte sha2-256 multihash
   if (cid.length !== 34 || cid[0] !== 0x12 || cid[1] !== 0x20) return null;
   return {
@@ -64,9 +67,11 @@ export function parseAiResponse(
   };
 }
 
-/** Public IPFS gateway URL for a CIDv0 (opened externally — the node doesn't serve IPFS). */
-export function ipfsUrl(cidV0: string): string {
-  return `https://keryx-labs.com/ipfs/${cidV0}`;
+export const PUBLIC_IPFS_GATEWAY = "https://keryx-labs.com";
+
+/** IPFS gateway URL for a CIDv0 (opened externally — the node doesn't serve IPFS). */
+export function ipfsUrl(cidV0: string, gateway: string = PUBLIC_IPFS_GATEWAY): string {
+  return `${gateway}/ipfs/${cidV0}`;
 }
 
 /**
@@ -78,9 +83,10 @@ export function ipfsUrl(cidV0: string): string {
  */
 export async function fetchAnswerText(
   cidV0: string,
+  gateway: string = PUBLIC_IPFS_GATEWAY,
   maxBytes = 256 * 1024,
 ): Promise<string> {
-  const resp = await fetch(ipfsUrl(cidV0));
+  const resp = await fetch(ipfsUrl(cidV0, gateway));
   if (!resp.ok) throw new Error(`IPFS gateway ${resp.status}`);
   const buf = new Uint8Array(await resp.arrayBuffer());
   const slice = buf.length > maxBytes ? buf.subarray(0, maxBytes) : buf;
