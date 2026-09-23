@@ -16,6 +16,9 @@ pub fn run() {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    prefer_x11_on_wayland();
+
     tauri::Builder::default()
         .setup(|app| {
             size_to_monitor(app.handle());
@@ -23,6 +26,27 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// Run GTK through XWayland when the session is Wayland.
+///
+/// On GNOME Wayland the compositor draws no titlebar, so GTK paints its own inside the same surface
+/// as the WebKitGTK view. On NVIDIA that surface comes up with no titlebar at all and the window
+/// can be neither moved nor minimized (WEBKIT_DISABLE_DMABUF_RENDERER does not help). Under X11
+/// the compositor draws the decorations itself and the window behaves normally.
+///
+/// Must run before GTK initializes, i.e. before the Builder. An explicit GDK_BACKEND wins, so
+/// `GDK_BACKEND=wayland keryx-wallet` still opts back into native Wayland; and without an X
+/// display (no XWayland) we leave GTK alone rather than fail to open a window.
+#[cfg(target_os = "linux")]
+fn prefer_x11_on_wayland() {
+    use std::env;
+
+    let wayland = env::var_os("WAYLAND_DISPLAY").is_some()
+        || env::var("XDG_SESSION_TYPE").is_ok_and(|t| t.eq_ignore_ascii_case("wayland"));
+    if wayland && env::var_os("GDK_BACKEND").is_none() && env::var_os("DISPLAY").is_some() {
+        env::set_var("GDK_BACKEND", "x11");
+    }
 }
 
 /// Size the window from the monitor it opened on.
