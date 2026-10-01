@@ -20,10 +20,12 @@ pub fn run() {
     prefer_x11_on_wayland();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             size_to_monitor(app.handle());
             Ok(())
         })
+        .invoke_handler(tauri::generate_handler![save_escrow_cert])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -52,6 +54,37 @@ fn prefer_x11_on_wayland() {
     if wayland && gnome && nvidia && env::var_os("GDK_BACKEND").is_none() && env::var_os("DISPLAY").is_some() {
         env::set_var("GDK_BACKEND", "x11");
     }
+}
+
+/// Write the H6 escrow cert to a path the user picks in the native save dialog.
+///
+/// The miner reads this file as-is (`--escrow-cert-file`, default name escrow.cert):
+/// 128 hex chars and a trailing newline. The webview has no filesystem permission —
+/// this command opens the dialog and writes the file itself. `Ok(false)` is cancel.
+#[tauri::command]
+fn save_escrow_cert(app: tauri::AppHandle, cert: String) -> Result<bool, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let cert = cert.trim().to_ascii_lowercase();
+    if cert.len() != 128 || !cert.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("escrow cert is not 128 hex characters".into());
+    }
+    let Some(picked) = app
+        .dialog()
+        .file()
+        .set_title("Save escrow.cert")
+        .set_file_name("escrow.cert")
+        .add_filter("Escrow certificate", &["cert"])
+        .blocking_save_file()
+    else {
+        return Ok(false);
+    };
+    let path = picked
+        .into_path()
+        .map_err(|_| "Could not save escrow.cert.".to_string())?;
+    std::fs::write(path, format!("{cert}\n"))
+        .map_err(|_| "Could not save escrow.cert.".to_string())?;
+    Ok(true)
 }
 
 /// Size the window from the monitor it opened on.

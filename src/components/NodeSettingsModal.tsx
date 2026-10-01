@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { useState } from "react";
 import { DEFAULT_NODES, NodeSettings, wallet } from "../lib/wallet";
 import { useWalletState } from "../lib/useWallet";
@@ -556,6 +557,7 @@ function AuthoriseMinerSection() {
   const [cert, setCert] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [downloaded, setDownloaded] = useState(false);
 
   function reset() {
     setOpen(false);
@@ -563,12 +565,14 @@ function AuthoriseMinerSection() {
     setCert(null);
     setErr(null);
     setCopied(false);
+    setDownloaded(false);
   }
 
   function authorise() {
     setErr(null);
     setCert(null);
     setCopied(false);
+    setDownloaded(false);
     try {
       const r = wallet.signEscrowDelegation(escrowKey);
       setCert(r.cert);
@@ -583,6 +587,20 @@ function AuthoriseMinerSection() {
       ?.writeText(`--escrow-cert ${cert}`)
       .then(() => setCopied(true))
       .catch(() => {});
+  }
+
+  // The miner loads this file as-is (`--escrow-cert-file`, default name escrow.cert):
+  // 128 hex chars, optional trailing newline. The flag form is only for hosts that
+  // cannot drop a file. The native save dialog is where the user picks the folder.
+  async function downloadCert() {
+    if (!cert) return;
+    setErr(null);
+    try {
+      const saved = await invoke<boolean>("save_escrow_cert", { cert });
+      if (saved) setDownloaded(true);
+    } catch {
+      setErr("Could not save escrow.cert. Copy the flag instead.");
+    }
   }
 
   const addr = w.receiveAddress ?? "";
@@ -626,11 +644,16 @@ function AuthoriseMinerSection() {
           </div>
           {cert && (
             <div className="mt-3">
-              <p className="mb-1 text-xs text-keryx-dim">Add this to your miner — nothing else changes:</p>
+              <p className="mb-1 text-xs text-keryx-dim">
+                Place <b>escrow.cert</b> next to the miner, or pass this flag:
+              </p>
               <code className="block break-all rounded-sm border border-keryx-border bg-keryx-green/[0.03] p-2 text-xs text-keryx-green">
                 --escrow-cert {cert}
               </code>
-              <div className="mt-2 flex items-center gap-3">
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <button className="btn-ghost px-3 py-1.5 text-xs" onClick={downloadCert}>
+                  {downloaded ? "✓ saved" : "Download escrow.cert"}
+                </button>
                 <button className="btn-ghost px-3 py-1.5 text-xs" onClick={copy}>
                   {copied ? "✓ copied" : "Copy"}
                 </button>
