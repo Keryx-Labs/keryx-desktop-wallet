@@ -40,10 +40,23 @@ struct KrxTicker {
     change_percent: String,
 }
 
+/// Every field is optional and loosely typed: the exchange has sent numbers where strings were
+/// expected before, and one odd field must not blank a price the other fields can still give.
 #[derive(serde::Deserialize)]
 struct TickerBody {
-    last_price: String,
-    change_percent: String,
+    #[serde(default)]
+    last_price: Option<serde_json::Value>,
+    #[serde(default)]
+    change_percent: Option<serde_json::Value>,
+}
+
+/// A JSON string or number as the text the exchange printed. Anything else is "no value".
+fn json_text(v: Option<serde_json::Value>) -> Option<String> {
+    match v? {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 /// Last traded KRX/USDT price and the 24h change, both as the exchange printed them.
@@ -60,32 +73,45 @@ async fn krx_market_price() -> Result<KrxTicker, String> {
         .map_err(|e| e.to_string())?
 }
 
+/// Largest ticker body we will read. The real one is a few hundred bytes.
+const MAX_TICKER_BYTES: usize = 64 * 1024;
+
 fn fetch_ticker() -> Result<KrxTicker, String> {
+    fetch_ticker_from(KRX_TICKER_URL, std::time::Duration::from_secs(8))
+}
+
+/// `timeout` bounds the whole request, body included, so a server that accepts the connection and
+/// then goes quiet cannot hold the thread. A failure is an `Err`, never a panic.
+fn fetch_ticker_from(url: &str, timeout: std::time::Duration) -> Result<KrxTicker, String> {
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
+        .timeout(timeout)
+        .connect_timeout(timeout.min(std::time::Duration::from_secs(4)))
         .user_agent("KeryxWallet")
         .build()
         .map_err(|e| e.to_string())?;
-    let body: TickerBody = client
-        .get(KRX_TICKER_URL)
+    let resp = client
+        .get(url)
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .map_err(|e| e.to_string())?
         .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json()
         .map_err(|e| e.to_string())?;
-    if !is_plain_decimal(&body.last_price) {
-        return Err("ticker last_price is not a decimal".into());
+    let bytes = resp.bytes().map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_TICKER_BYTES {
+        return Err("ticker response is too large".into());
+    }
+    let body: TickerBody = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let last_price = json_text(body.last_price).unwrap_or_default();
+    // A zero price would print "$0.00" next to a real balance, which reads as a worthless coin.
+    if !is_plain_decimal(&last_price) || last_price.chars().all(|c| c == '0' || c == '.') {
+        return Err("ticker last_price is not a positive decimal".into());
     }
     // A missing or odd change must not blank the price. The hero simply omits the percent.
-    let change_percent = if is_signed_decimal(&body.change_percent) {
-        body.change_percent
-    } else {
-        String::new()
-    };
+    let change_percent = json_text(body.change_percent)
+        .filter(|c| is_signed_decimal(c))
+        .unwrap_or_default();
     Ok(KrxTicker {
-        last_price: body.last_price,
+        last_price,
         change_percent,
     })
 }
@@ -169,5 +195,97 @@ fn size_to_monitor(app: &tauri::AppHandle) {
     let width = (height * 1.6).min(screen.width * 0.90).max(420.0);
     if win.set_size(LogicalSize::new(width, height)).is_ok() {
         let _ = win.center();
+    }
+}
+
+#[cfg(test)]
+mod ticker_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    /// One-shot local HTTP server. `reply` None means: accept, read, then never answer.
+    fn serve(reply: Option<&'static str>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                match reply {
+                    Some(r) => {
+                        let _ = sock.write_all(r.as_bytes());
+                    }
+                    None => std::thread::sleep(Duration::from_secs(30)),
+                }
+            }
+        });
+        url
+    }
+
+    fn http(status: &str, body: &str) -> &'static str {
+        Box::leak(
+            format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        )
+    }
+
+    const T: Duration = Duration::from_millis(800);
+
+    #[test]
+    fn good_ticker_parses() {
+        let url = serve(Some(http("200 OK", r#"{"last_price":"0.00122876","change_percent":"11.70"}"#)));
+        let t = fetch_ticker_from(&url, T).unwrap();
+        assert_eq!((t.last_price.as_str(), t.change_percent.as_str()), ("0.00122876", "11.70"));
+    }
+
+    #[test]
+    fn silent_server_times_out_instead_of_hanging() {
+        let url = serve(None);
+        let start = Instant::now();
+        assert!(fetch_ticker_from(&url, T).is_err());
+        assert!(start.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn refused_connection_is_an_error() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", l.local_addr().unwrap());
+        drop(l);
+        assert!(fetch_ticker_from(&url, T).is_err());
+    }
+
+    #[test]
+    fn http_errors_are_errors() {
+        for status in ["403 Forbidden", "429 Too Many Requests", "500 Internal Server Error", "503 Service Unavailable"] {
+            assert!(fetch_ticker_from(&serve(Some(http(status, "{}"))), T).is_err(), "{status}");
+        }
+    }
+
+    #[test]
+    fn garbage_bodies_are_errors() {
+        for body in ["<html>maintenance</html>", "", "null", "[]", r#"{"last_price":"abc"}"#, r#"{"last_price":"0"}"#, r#"{"last_price":"0.000"}"#, r#"{"last_price":"-1"}"#, r#"{"last_price":null}"#, r#"{}"#] {
+            assert!(fetch_ticker_from(&serve(Some(http("200 OK", body))), T).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn odd_change_keeps_the_price() {
+        for body in [r#"{"last_price":"0.0012"}"#, r#"{"last_price":"0.0012","change_percent":null}"#, r#"{"last_price":"0.0012","change_percent":"n/a"}"#] {
+            let t = fetch_ticker_from(&serve(Some(http("200 OK", body))), T).unwrap();
+            assert_eq!(t.last_price, "0.0012");
+            assert_eq!(t.change_percent, "");
+        }
+    }
+
+    #[test]
+    fn numbers_instead_of_strings_are_accepted() {
+        let url = serve(Some(http("200 OK", r#"{"last_price":0.0012,"change_percent":-3.2}"#)));
+        let t = fetch_ticker_from(&url, T).unwrap();
+        assert_eq!((t.last_price.as_str(), t.change_percent.as_str()), ("0.0012", "-3.2"));
     }
 }

@@ -4,6 +4,13 @@ import { useEffect, useState } from "react";
 /** How often the NonKYC last price is re-read. A market quote does not need the 15s history poll. */
 const POLL_MS = 60_000;
 
+/**
+ * How long the last good quote stays on screen once refreshes start failing. Past this the price
+ * disappears: a number that quiet is no longer the market, and an old dollar figure next to a
+ * live balance is worse than none.
+ */
+const STALE_MS = 10 * 60_000;
+
 /** Sompi per KRX. Same scale `formatKrx` divides by. */
 const SOMPI_SCALE = 8;
 
@@ -24,19 +31,27 @@ interface TickerResponse {
 }
 
 let snapshot: KrxPrice | null = null;
+let snapshotAt = 0;
 const listeners = new Set<(price: KrxPrice | null) => void>();
 let timer: number | null = null;
 let inflight = false;
 
 function parseTicker(raw: TickerResponse): KrxPrice | null {
-  if (!/^\d+(\.\d+)?$/.test(raw.last_price)) return null;
+  if (typeof raw?.last_price !== "string" || !/^\d{1,12}(\.\d{1,18})?$/.test(raw.last_price)) return null;
   const [whole, frac = ""] = raw.last_price.split(".");
+  // A zero quote would print "$0.00" beside a real balance.
+  if (BigInt(whole + frac) === 0n) return null;
   return {
     lastPrice: raw.last_price,
     priceInt: BigInt(whole + frac),
     priceScale: frac.length,
-    changePercent: raw.change_percent,
+    changePercent: typeof raw.change_percent === "string" ? raw.change_percent : "",
   };
+}
+
+function publish(next: KrxPrice | null) {
+  snapshot = next;
+  for (const listener of listeners) listener(snapshot);
 }
 
 async function refresh() {
@@ -45,11 +60,14 @@ async function refresh() {
   try {
     const raw = await invoke<TickerResponse>("krx_market_price");
     const next = parseTicker(raw);
-    if (!next) return;
-    snapshot = next;
-    for (const listener of listeners) listener(snapshot);
+    if (!next) throw new Error("unusable ticker");
+    snapshotAt = Date.now();
+    publish(next);
   } catch {
-    // Keep the last good quote. A blip must not blank a number the user is looking at.
+    // Timeout, offline, exchange down or a bad payload. Keep the last good quote for a while so a
+    // blip does not blank a number the user is looking at, then drop it once it is too old.
+    // Polling carries on, so the price comes back by itself when the exchange does.
+    if (snapshot && Date.now() - snapshotAt > STALE_MS) publish(null);
   } finally {
     inflight = false;
   }
