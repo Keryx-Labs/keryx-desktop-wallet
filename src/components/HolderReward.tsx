@@ -120,6 +120,11 @@ export function HolderRewardPanel() {
   // How many windows of its own production the address holds, and how many the top rung wants.
   const held = ratio1dp(effBalance, production);
   const fullMultiple = production > 0n ? Number(data.fullBracketBalance / production) : 0;
+  // Share of the top rung's balance already held, floored and clamped. Integer math: both are sompi.
+  const hasFull = data.fullBracketBalance > 0n;
+  const fullPct = hasFull
+    ? Math.max(0, Math.min(100, Number((effBalance * 100n) / data.fullBracketBalance)))
+    : 0;
   const atTop = nextBracketBps === null || nextBracketBalance === null;
   // Progress toward the NEXT rung, not toward 100% — that is the number the holder can act on.
   const windowLabel = Number(data.windowDaa) === 864_000 ? "24h" : "window";
@@ -317,9 +322,28 @@ export function HolderRewardPanel() {
           <dt className="text-keryx-dim" title="Coin-age effective balance: coins younger than the maturity window count at a prorata of their age.">
             Effective balance
           </dt>
-          <dd className="num text-keryx-mid">{krxWhole(effBalance)} KRX</dd>
+          <dd className="num text-keryx-mid">
+            {krxWhole(effBalance)}
+            {hasFull && (
+              <span title="Effective balance at which the top rung is reached"> / {krxWhole(data.fullBracketBalance)}</span>
+            )}{" "}
+            KRX
+          </dd>
         </div>
       </dl>
+      {hasFull && (
+        <div className="mt-1.5">
+          <div className="h-1 w-full overflow-hidden rounded-sm bg-keryx-border">
+            <div
+              className="h-full bg-keryx-green transition-all duration-500"
+              style={{ width: `${fullPct}%` }}
+            />
+          </div>
+          <p className="mt-1 text-[10px] uppercase tracking-wider text-keryx-dim">
+            {fullPct}% of the balance needed for a full bracket
+          </p>
+        </div>
+      )}
 
       {/* The mix behind the weighted tier above. Shown only when more than one tier contributed:
           for a single-model miner the weighted figure already says everything and a one-row
@@ -447,9 +471,7 @@ export function HolderRewardPanel() {
           {etaFull !== null && (
             <p className="mt-1 text-[10px] uppercase tracking-wider text-keryx-dim">
               100% in <span className="text-keryx-mid">{etaLabel(etaFull)}</span> if held at this
-              rate · full at{" "}
-              <span className="text-keryx-bright">{krxWhole(data.fullBracketBalance)} KRX</span>{" "}
-              effective
+              rate
             </p>
           )}
         </div>

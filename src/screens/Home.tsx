@@ -329,26 +329,26 @@ export function Home({ onOpen }: { onOpen: (key: ModalKey) => void }) {
             <span className="text-lg font-medium tracking-label text-keryx-dim">KRX</span>
           </p>
           {!switching && price && (
-            <p
-              className="num mt-1 flex flex-wrap items-baseline gap-x-2 text-sm text-keryx-mid"
-              title="NonKYC KRX/USDT last price, applied to the mature balance"
-            >
-              <span>≈ {formatUsd(w.balance.mature, price)}</span>
-              <span className="text-xs text-keryx-dim">${price.lastPrice}</span>
-              {change && (
-                <span
-                  className={`text-xs ${
-                    change.direction === "up"
-                      ? "text-keryx-green"
-                      : change.direction === "down"
-                        ? "text-keryx-error"
-                        : "text-keryx-dim"
-                  }`}
-                >
-                  {change.text}
-                </span>
-              )}
-            </p>
+            <div className="num mt-2" title="NonKYC KRX/USDT last price, applied to the mature balance">
+              <p className="text-lg font-medium text-keryx-bright">≈ {formatUsd(w.balance.mature, price)}</p>
+              <p className="mt-0.5 flex flex-wrap items-baseline gap-x-2 text-[11px] text-keryx-dim">
+                <span>NonKYC · ${price.lastPrice} / KRX</span>
+                {change && (
+                  <span
+                    className={
+                      change.direction === "up"
+                        ? "text-keryx-green"
+                        : change.direction === "down"
+                          ? "text-keryx-error"
+                          : "text-keryx-dim"
+                    }
+                  >
+                    {change.direction === "up" ? "▲ " : change.direction === "down" ? "▼ " : ""}
+                    {change.text.replace(/^[+-]/, "")} 24h
+                  </span>
+                )}
+              </p>
+            </div>
           )}
           {switching && (
             <p className="mt-2 flex items-center gap-2 text-xs text-keryx-mid">
