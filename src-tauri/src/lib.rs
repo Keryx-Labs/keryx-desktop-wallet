@@ -61,8 +61,11 @@ fn prefer_x11_on_wayland() {
 /// The miner reads this file as-is (`--escrow-cert-file`, default name escrow.cert):
 /// 128 hex chars and a trailing newline. The webview has no filesystem permission —
 /// this command opens the dialog and writes the file itself. `Ok(false)` is cancel.
+///
+/// `async` on purpose: a sync command runs on the main thread, and `blocking_save_file` waits for
+/// a dialog that the main thread has to drive (GTK on Linux), so the window would freeze.
 #[tauri::command]
-fn save_escrow_cert(app: tauri::AppHandle, cert: String) -> Result<bool, String> {
+async fn save_escrow_cert(app: tauri::AppHandle, cert: String) -> Result<bool, String> {
     use tauri_plugin_dialog::DialogExt;
 
     let cert = cert.trim().to_ascii_lowercase();
