@@ -447,7 +447,9 @@ export function HolderRewardPanel() {
           {etaFull !== null && (
             <p className="mt-1 text-[10px] uppercase tracking-wider text-keryx-dim">
               100% in <span className="text-keryx-mid">{etaLabel(etaFull)}</span> if held at this
-              rate
+              rate · full at{" "}
+              <span className="text-keryx-bright">{krxWhole(data.fullBracketBalance)} KRX</span>{" "}
+              effective
             </p>
           )}
         </div>

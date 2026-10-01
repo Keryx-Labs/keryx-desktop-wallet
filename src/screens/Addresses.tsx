@@ -4,6 +4,7 @@ import { useWalletState } from "../lib/useWallet";
 import { Modal } from "../components/Modal";
 import { SeedBackup } from "../components/SeedBackup";
 import { AliasField } from "../components/AliasField";
+import { formatUsd, useKrxPrice } from "../lib/krxPrice";
 
 /*
  * Wallet manager. Each entry is a WALLET — its own recovery phrase, its own account, its own
@@ -139,6 +140,7 @@ function WalletList({
   }
 
   const total = w.totalBalanceSompi;
+  const price = useKrxPrice();
 
   return (
     <>
@@ -149,6 +151,9 @@ function WalletList({
             {formatKrxShort(total)}{" "}
             <span className="text-xs font-medium tracking-label text-keryx-dim">KRX</span>
           </p>
+          {price && (
+            <p className="num mt-0.5 text-xs text-keryx-mid">≈ {formatUsd(total, price)}</p>
+          )}
         </div>
         <span className="badge shrink-0">
           {w.walletCount} wallet{w.walletCount === 1 ? "" : "s"}

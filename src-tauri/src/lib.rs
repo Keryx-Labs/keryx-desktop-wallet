@@ -24,8 +24,98 @@ pub fn run() {
             size_to_monitor(app.handle());
             Ok(())
         })
+        .invoke_handler(tauri::generate_handler![krx_market_price])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// NonKYC public ticker for the KRX/USDT market. The webview cannot call this itself: the
+/// exchange answers 403 to any request that carries an Origin header, and the 200 response
+/// has no Access-Control-Allow-Origin. This process does not send Origin.
+const KRX_TICKER_URL: &str = "https://api.nonkyc.io/api/v2/ticker/KRX_USDT";
+
+#[derive(serde::Serialize)]
+struct KrxTicker {
+    last_price: String,
+    change_percent: String,
+}
+
+#[derive(serde::Deserialize)]
+struct TickerBody {
+    last_price: String,
+    change_percent: String,
+}
+
+/// Last traded KRX/USDT price and the 24h change, both as the exchange printed them.
+///
+/// Kept as strings on purpose: the frontend multiplies the balance by the price with integer
+/// arithmetic, and a float round-trip here would be the only place that could drift.
+///
+/// A thread-pool job, not a main-thread call: the request can take up to its 8s timeout, and a
+/// sync command would freeze the window for that long on every poll.
+#[tauri::command]
+async fn krx_market_price() -> Result<KrxTicker, String> {
+    tauri::async_runtime::spawn_blocking(fetch_ticker)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn fetch_ticker() -> Result<KrxTicker, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .user_agent("KeryxWallet")
+        .build()
+        .map_err(|e| e.to_string())?;
+    let body: TickerBody = client
+        .get(KRX_TICKER_URL)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json()
+        .map_err(|e| e.to_string())?;
+    if !is_plain_decimal(&body.last_price) {
+        return Err("ticker last_price is not a decimal".into());
+    }
+    // A missing or odd change must not blank the price. The hero simply omits the percent.
+    let change_percent = if is_signed_decimal(&body.change_percent) {
+        body.change_percent
+    } else {
+        String::new()
+    };
+    Ok(KrxTicker {
+        last_price: body.last_price,
+        change_percent,
+    })
+}
+
+/// Non-negative decimal: "0.00084214" or "1". No sign, no exponent, no thousands separators.
+fn is_plain_decimal(s: &str) -> bool {
+    let mut dot = false;
+    let mut digits = 0u32;
+    for c in s.chars() {
+        if c == '.' {
+            if dot {
+                return false;
+            }
+            dot = true;
+        } else if c.is_ascii_digit() {
+            digits += 1;
+        } else {
+            return false;
+        }
+    }
+    digits > 0 && !s.starts_with('.') && !s.ends_with('.')
+}
+
+/// Decimal that may carry one leading '+' or '-'.
+fn is_signed_decimal(s: &str) -> bool {
+    let rest = s
+        .strip_prefix('+')
+        .or_else(|| s.strip_prefix('-'))
+        .unwrap_or(s);
+    is_plain_decimal(rest)
 }
 
 /// Run GTK through XWayland on a GNOME Wayland session with the NVIDIA driver.

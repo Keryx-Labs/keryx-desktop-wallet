@@ -5,6 +5,7 @@ import { useState } from "react";
 // on a 2x display. keryx-logo.png stays the source of truth for the art.
 import mark from "../assets/keryx-mark.png";
 import { ConnStatus, formatKrxShort } from "../lib/wallet";
+import { formatUsd, useKrxPrice } from "../lib/krxPrice";
 import { ModalKey } from "../lib/nav";
 
 /**
@@ -158,6 +159,8 @@ function WalletSelector({
   onOpen: () => void;
 }) {
   const many = count > 1;
+  const price = useKrxPrice();
+  const usd = price && totalSompi !== undefined ? formatUsd(totalSompi, price) : null;
   return (
     <button
       onClick={onOpen}
@@ -193,7 +196,7 @@ function WalletSelector({
         </span>
         <span className="num mt-px block truncate text-[9px] text-keryx-dim">
           {totalSompi !== undefined
-            ? `${formatKrxShort(totalSompi)} KRX ${many ? "all wallets" : "total"}`
+            ? `${formatKrxShort(totalSompi)} KRX ${many ? "all wallets" : "total"}${usd ? ` · ${usd}` : ""}`
             : ""}
         </span>
       </span>
