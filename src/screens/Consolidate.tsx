@@ -32,6 +32,7 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
     run && !run.running && (run.txids.length > 0 || run.phase === "failed") ? run : null;
 
   const [stats, setStats] = useState<Stats | null>(null);
+  const [statsFailed, setStatsFailed] = useState(false);
   const [cost, setCost] = useState<Cost | null>(null);
   const [costBusy, setCostBusy] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
@@ -52,8 +53,10 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
     try {
       const s = await wallet.utxoStats();
       setStats(s);
+      setStatsFailed(false);
       return s;
     } catch {
+      setStatsFailed(true);
       return null;
     }
   }, []);
@@ -80,6 +83,7 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
 
   async function start() {
     setErr(null);
+    setStats(null); // the pre-run count is wrong the moment the first batch lands
     try {
       // The accepted estimate is a hard ceiling: the run trims its last round to the remaining
       // fee budget and stops when it is exhausted, so it can never spend more than confirmed.
@@ -100,6 +104,14 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
   // null) for the first moment of a run, which rendered a full bar before the first UTXO read.
   const progress = run ? consolidateRunPercent(run) : 0;
 
+  // UTXOs left once a run is over. The post-run snapshot (`loadStats`) can fail or still be in
+  // flight on a big wallet, and a missing snapshot used to read as 0 here: the screen claimed
+  // "everything is consolidated" and disabled "Consolidate again" while the run's own header said
+  // 262623 → 1093. The run's last measured count is the fallback; null means genuinely unknown,
+  // and unknown must leave the button enabled, because starting a run re-reads the set itself.
+  const finishedCount: number | null =
+    stats?.count ?? (finished && finished.startCount > 1 ? finished.remaining : null);
+
   const phaseLabel: Record<string, string> = {
     building: "reading your UTXOs",
     submitting: "submitting transactions",
@@ -115,7 +127,18 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
       <div className="card mb-4 p-3">
         <div className="flex items-center justify-between text-xs text-keryx-text">
           <span>Coins (UTXOs) on this wallet</span>
-          <span className="num text-keryx-bright">{stats ? stats.count : "…"}</span>
+          {stats || !statsFailed ? (
+            <span className="num text-keryx-bright">{stats ? stats.count : "…"}</span>
+          ) : (
+            // The read timed out or the node was busy. Without this the count stays 0 and the form
+            // reads "Nothing to do" with no way to try again short of reopening the window.
+            <button
+              className="text-keryx-warn underline"
+              onClick={() => void loadStats()}
+            >
+              Could not read, retry
+            </button>
+          )}
         </div>
         {stats && (
           <div className="mt-1 flex items-center justify-between text-[11px] text-keryx-dim">
@@ -198,9 +221,11 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
             {finished.txids.length} transaction{finished.txids.length === 1 ? "" : "s"} submitted,{" "}
             {formatKrx(finished.feePaidSompi)} KRX in fees
             {finished.txsFailed > 0 ? ` · ${finished.txsFailed} failed` : ""}.{" "}
-            {count <= 1
-              ? "Everything is consolidated into a single UTXO."
-              : `${count} UTXOs remain. Run it again if that is still more than you want.`}{" "}
+            {finishedCount === null
+              ? "Run it again to check whether anything is left to consolidate."
+              : finishedCount <= 1
+                ? "Everything is consolidated into a single UTXO."
+                : `${finishedCount} UTXOs remain. Run it again if that is still more than you want.`}{" "}
             The consolidated balance becomes spendable after it matures.
           </p>
 
@@ -242,12 +267,25 @@ export function Consolidate({ onClose }: { onClose: () => void }) {
                 setErr(null);
                 void loadStats();
               }}
-              disabled={count <= 1}
-              title={count <= 1 ? "Nothing left to consolidate" : undefined}
+              disabled={finishedCount !== null && finishedCount <= 1}
+              title={
+                finishedCount !== null && finishedCount <= 1
+                  ? "Nothing left to consolidate"
+                  : undefined
+              }
             >
               Consolidate again
             </button>
-            <button className="btn-primary flex-1" onClick={onClose}>
+            {/* Done also discards the finished run. The run lives on the service, so leaving it in
+                place made every later open of this window show this same result, with no way back
+                to the form when "Consolidate again" was disabled. The X still keeps the result. */}
+            <button
+              className="btn-primary flex-1"
+              onClick={() => {
+                wallet.clearConsolidateRun();
+                onClose();
+              }}
+            >
               Done
             </button>
           </div>
