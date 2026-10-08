@@ -5,6 +5,7 @@ import { wallet, formatKrxShort, HistoryEntry, ReceivedEntry } from "../lib/wall
 import { useWalletState } from "../lib/useWallet";
 import { HolderRewardPanel } from "../components/HolderReward";
 import { ModalKey } from "../lib/nav";
+import { formatChange, formatUsd, useKrxPrice } from "../lib/krxPrice";
 
 const HISTORY_POLL_MS = 15_000;
 /**
@@ -198,6 +199,8 @@ export function Home({ onOpen }: { onOpen: (key: ModalKey) => void }) {
   // While a switch is in flight the new wallet's balance has not been read yet. Showing the 0 it
   // holds meanwhile reads as "this wallet is empty", which is alarming and wrong.
   const switching = w.switchingWallet !== null;
+  const price = useKrxPrice();
+  const change = price ? formatChange(price.changePercent) : null;
   const balanceText = formatKrxShort(w.balance.mature);
   const balanceType =
     balanceText.length > 12
@@ -325,6 +328,28 @@ export function Home({ onOpen }: { onOpen: (key: ModalKey) => void }) {
             {switching ? "—" : balanceText}{" "}
             <span className="text-lg font-medium tracking-label text-keryx-dim">KRX</span>
           </p>
+          {!switching && price && (
+            <div className="num mt-2" title="NonKYC KRX/USDT last price, applied to the mature balance">
+              <p className="text-lg font-medium text-keryx-bright">≈ {formatUsd(w.balance.mature, price)}</p>
+              <p className="mt-0.5 flex flex-wrap items-baseline gap-x-2 text-[11px] text-keryx-dim">
+                <span>NonKYC · ${price.lastPrice} / KRX</span>
+                {change && (
+                  <span
+                    className={
+                      change.direction === "up"
+                        ? "text-keryx-green"
+                        : change.direction === "down"
+                          ? "text-keryx-error"
+                          : "text-keryx-dim"
+                    }
+                  >
+                    {change.direction === "up" ? "▲ " : change.direction === "down" ? "▼ " : ""}
+                    {change.text.replace(/^[+-]/, "")} 24h
+                  </span>
+                )}
+              </p>
+            </div>
+          )}
           {switching && (
             <p className="mt-2 flex items-center gap-2 text-xs text-keryx-mid">
               <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-keryx-green" />
