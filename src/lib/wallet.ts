@@ -6,6 +6,7 @@ import wasmUrl from "../sdk/kaspa_bg.wasm?url";
 import {
   buildAiRequestTx,
   computeInferenceReward,
+  h14ActivationDaa,
   type AiAvailability,
   MODELS,
   ModelName,
@@ -2393,8 +2394,9 @@ class WalletService {
     this.txInFlight = true;
     try {
       const rewardSompi = computeInferenceReward(
-        MODELS[req.model].baseRewardSompi,
+        MODELS[req.model],
         req.maxTokens,
+        this.nodeDaa != null && this.nodeDaa >= h14ActivationDaa(this.networkId),
       );
       const feeSompi =
         req.priorityFeeSompi && req.priorityFeeSompi > MIN_AI_REQUEST_PRIORITY_FEE

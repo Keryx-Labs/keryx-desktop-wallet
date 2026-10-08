@@ -7,6 +7,7 @@ import {
   formatKrx,
 } from "../lib/wallet";
 import { useWalletState } from "../lib/useWallet";
+import { h14ActivationDaa } from "../lib/aiRequest";
 
 /** The bracket only moves as coins ripen and blocks land — a slow poll is plenty. */
 const POLL_MS = 60_000;
@@ -27,6 +28,7 @@ const POLL_MS = 60_000;
  * computed from the node's own bucket amounts, never from these bps.
  */
 const TIER_LABELS = ["Qwen3.5-9B", "tier 1", "Gemma-4-12B", "Qwen3.6-27B", "Kimi-48B"];
+const TIER_LABELS_H14 = ["Qwen3.5-9B", "tier 1", "Gemma-4-12B", "Qwen3.8-27B", "Kimi-48B"];
 const TIER_BPS = [6_000n, 7_000n, 8_000n, 9_000n, 10_000n];
 
 /** bps out of 10_000 → a percentage string with no trailing ".0" ("7500" → "75%"). */
@@ -86,6 +88,8 @@ export function HolderRewardPanel() {
   const [standing, setStanding] = useState<ServiceStanding | null>(null);
 
   const addr = w.receiveAddress;
+  const tierLabels =
+    w.nodeDaa != null && BigInt(w.nodeDaa) >= h14ActivationDaa(w.networkId) ? TIER_LABELS_H14 : TIER_LABELS;
 
   const refresh = useCallback(async () => {
     const r = await wallet.holderReward();
@@ -331,7 +335,7 @@ export function HolderRewardPanel() {
           {tierMix.map(({ t, amount }) => (
             <div key={t} className="flex items-baseline justify-between gap-2 text-[11px]">
               <dt className="truncate text-keryx-dim">
-                {TIER_LABELS[t] ?? `tier ${t}`}{" "}
+                {tierLabels[t] ?? `tier ${t}`}{" "}
                 {/* "pays" is load-bearing: without it the row shows two percentages of different
                     kinds — the tier's reward rate and its share of production — and the reader has
                     no way to tell which is which. */}

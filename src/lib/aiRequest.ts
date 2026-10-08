@@ -43,8 +43,15 @@ export const MAX_AI_REQUEST_PAYLOAD_LEN = 4096;
 
 /** Minimum burned priority fee: 0.3 KRX (MIN_AI_REQUEST_PRIORITY_FEE). */
 export const MIN_AI_REQUEST_PRIORITY_FEE = 30_000_000n;
-/** inference_reward surcharge per 64-token increment: 0.05 KRX. */
+/** inference_reward surcharge per 64-token increment: 0.05 KRX, until H14. */
 export const INFERENCE_REWARD_TOKEN_STEP = 5_000_000n;
+
+/** H14. Mirrors the node's `private_inference_activation`: flat inference_reward, tier 3 becomes Qwen3.8-27B. */
+export function h14ActivationDaa(networkId: string): bigint {
+  if (networkId === "mainnet") return 121_985_000n;
+  if (networkId === "testnet" || networkId === "testnet-10") return 6_000n;
+  return BigInt(Number.MAX_SAFE_INTEGER);
+}
 /** Keyless reward vault script (OP_RETURN "aivault"), output[1] of every request. */
 export const INFERENCE_VAULT_SCRIPT_HEX = "6a0761697661756c74";
 
@@ -65,7 +72,7 @@ const COINBASE_MATURITY = 1000;
 export const PRIVATE_MARKER_SOMPI = 50_000_000n; // 0.5 KRX, self-send (reclaimable)
 
 // ---------------------------------------------------------------------------
-// Model registry (H6 lineup, tiers 0..4, plus the H14 network model) — model_id + base
+// Model registry (H6 and H14 lineups, tiers 0..4, plus the network model) — model_id + base
 // inference_reward. Values verified against INFERENCE_REWARD_MINIMUMS_V2_H14 in the node params.
 // ---------------------------------------------------------------------------
 
@@ -74,6 +81,7 @@ export type ModelName =
   | "glm-4-9b-0414"
   | "gemma-4-12b-abliterated"
   | "qwen3.6-27b"
+  | "qwen3.8-27b"
   | "kimi-linear-48b"
   | "deepseek-v4-flash"
   | "split9b-bench";
@@ -81,6 +89,8 @@ export type ModelName =
 export interface ModelInfo {
   modelIdHex: string;
   baseRewardSompi: bigint;
+  /** Fixed inference_reward from H14 (no token surcharge). */
+  flatRewardSompi: bigint;
   label: string;
 }
 
@@ -88,46 +98,58 @@ export const MODELS: Record<ModelName, ModelInfo> = {
   "qwen3.5-9b-abliterated": {
     modelIdHex: "bd34568cd89f5f19c6c3a6e1a61b929bc868709409eaad8e672d85f3c1eb5710",
     baseRewardSompi: 100_000_000n, // 1.0 KRX
+    flatRewardSompi: 50_000_000n, // 0.5 KRX
     label: "Qwen3.5-9B (uncensored)",
   },
   "glm-4-9b-0414": {
     modelIdHex: "fa2f13be0850e26c5ce86c7ac79da85e300c1da8b3290f9a18d47105f1f2140a",
     baseRewardSompi: 150_000_000n, // 1.5 KRX
+    flatRewardSompi: 100_000_000n, // 1.0 KRX
     label: "GLM-4-9B (uncensored)",
   },
   "gemma-4-12b-abliterated": {
     modelIdHex: "399984045600f7d58d1b2cf01e6a4bf466fa15c7ac31bd0dd1a71e003b617cc6",
     baseRewardSompi: 200_000_000n, // 2.0 KRX
+    flatRewardSompi: 150_000_000n, // 1.5 KRX
     label: "Gemma-4-12B (uncensored)",
   },
   "qwen3.6-27b": {
     modelIdHex: "b8bdc01fa407eab943e4fefc807483b39f8142785256049e1f559698a5284746",
     baseRewardSompi: 250_000_000n, // 2.5 KRX
+    flatRewardSompi: 200_000_000n, // 2.0 KRX
     label: "Qwen3.6-27B (uncensored)",
+  },
+  "qwen3.8-27b": {
+    modelIdHex: "73740b443bdc00afda5fa34eb9999d3fea77dcc3f6de238fab701394cdc96fb3",
+    baseRewardSompi: 250_000_000n, // 2.5 KRX
+    flatRewardSompi: 200_000_000n, // 2.0 KRX
+    label: "Qwen3.8-27B (uncensored)",
   },
   "kimi-linear-48b": {
     modelIdHex: "3dc09358ad75c6ef0c9c86ee4f47c4d6acda961fecbd0e4f9cf55e8f0fdffddb",
     baseRewardSompi: 400_000_000n, // 4.0 KRX
+    flatRewardSompi: 250_000_000n, // 2.5 KRX
     label: "Kimi-Linear-48B (uncensored)",
   },
   // devnet bench only: the 9B split in two shards (node SPLIT9B_WHOLE_MODEL_ID).
   "split9b-bench": {
     modelIdHex: "1f22b2133c40b16d0ba15dffb4823f889b76eb834fe6c90dedc6a38d504a46cb",
     baseRewardSompi: 100_000_000n, // 1.0 KRX, shared by the two shard miners
+    flatRewardSompi: 100_000_000n,
     label: "Qwen3.5-9B bench (2 shards)",
   },
   "deepseek-v4-flash": {
     modelIdHex: "918570a84e9e18322110170332f80a9225e078ca7fc7b54fcda3a7f45ab65810",
     baseRewardSompi: 400_000_000n, // 4.0 KRX, shared by the six shard miners
+    flatRewardSompi: 400_000_000n,
     label: "DeepSeek-V4-Flash (uncensored, 6 shards)",
   },
 };
 
-// H14 (model split). Mirrors the node's `model_split_activation`: past it the lineup is paused
-// and the network model is the only servable target. Mainnet not scheduled yet.
-export function h14ActivationDaa(networkId: string): bigint {
-  if (networkId === "devnet") return 500n;
-  return networkId === "mainnet" ? BigInt(Number.MAX_SAFE_INTEGER) : 133_000n;
+// Model split. Mirrors the node's `model_split_activation`: past it the lineup is paused and the
+// network model is the only servable target. Devnet bench only.
+export function modelSplitActivationDaa(networkId: string): bigint {
+  return networkId === "devnet" ? 500n : BigInt(Number.MAX_SAFE_INTEGER);
 }
 
 /** The network model: split V4-Flash, or the two-shard 9B bench on devnet. */
@@ -151,10 +173,11 @@ export interface AiAvailability {
   shards: ShardAvailability[];
 }
 
-/** effective inference_reward minimum = base + ceil(max_tokens/64) * TOKEN_STEP. */
-export function computeInferenceReward(baseSompi: bigint, maxTokens: number): bigint {
+/** effective inference_reward minimum = base + ceil(max_tokens/64) * TOKEN_STEP, or the model's fixed reward once live. */
+export function computeInferenceReward(model: { baseRewardSompi: bigint; flatRewardSompi: bigint }, maxTokens: number, flat = false): bigint {
+  if (flat) return model.flatRewardSompi;
   const steps = BigInt(Math.ceil(maxTokens / 64));
-  return baseSompi + steps * INFERENCE_REWARD_TOKEN_STEP;
+  return model.baseRewardSompi + steps * INFERENCE_REWARD_TOKEN_STEP;
 }
 
 // ---------------------------------------------------------------------------

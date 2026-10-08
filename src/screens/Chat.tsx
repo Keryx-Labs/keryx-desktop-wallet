@@ -8,6 +8,7 @@ import {
   MIN_AI_REQUEST_PRIORITY_FEE,
   PRIVATE_MARKER_SOMPI,
   h14ActivationDaa,
+  modelSplitActivationDaa,
   networkModelFor,
   type AiAvailability,
 } from "../lib/aiRequest";
@@ -34,6 +35,14 @@ const LINEUP_H6: ModelName[] = [
   "glm-4-9b-0414",
   "gemma-4-12b-abliterated",
   "qwen3.6-27b",
+  "kimi-linear-48b",
+];
+
+const LINEUP_H14: ModelName[] = [
+  "qwen3.5-9b-abliterated",
+  "glm-4-9b-0414",
+  "gemma-4-12b-abliterated",
+  "qwen3.8-27b",
   "kimi-linear-48b",
 ];
 
@@ -168,14 +177,15 @@ export function Chat({ onClose }: { onClose: () => void }) {
       clearInterval(id);
     };
   }, [w.networkId]);
-  // Past H14 the lineup is paused: the network model is the only servable target.
+  // Past the model split the lineup is paused: the network model is the only servable target.
   const networkModel = networkModelFor(w.networkId);
   const h14Active = w.nodeDaa != null && BigInt(w.nodeDaa) >= h14ActivationDaa(w.networkId);
-  const modelOrder: ModelName[] = h14Active ? [networkModel] : LINEUP_H6;
+  const splitActive = w.nodeDaa != null && BigInt(w.nodeDaa) >= modelSplitActivationDaa(w.networkId);
+  const modelOrder: ModelName[] = splitActive ? [networkModel] : h14Active ? LINEUP_H14 : LINEUP_H6;
   useEffect(() => {
     if (!modelOrder.includes(model)) setModel(modelOrder[0]);
-  }, [h14Active]);
-  const networkModelSelected = h14Active && model === networkModel;
+  }, [h14Active, splitActive]);
+  const networkModelSelected = splitActive && model === networkModel;
   const missingShard = availability?.shards.find((s) => s.producers === 0) ?? null;
   const minersFor = (k: ModelName) => caps?.get(MODELS[k].modelIdHex) ?? 0;
   // Network model: the thinnest shard decides.
@@ -256,7 +266,7 @@ export function Chat({ onClose }: { onClose: () => void }) {
 
   // Cost = reward (vault → responder) + fee (burned). Computed from the node-enforced
   // minimums.
-  const rewardSompi = computeInferenceReward(MODELS[model].baseRewardSompi, maxTokens);
+  const rewardSompi = computeInferenceReward(MODELS[model], maxTokens, h14Active);
   const feeSompi = MIN_AI_REQUEST_PRIORITY_FEE;
   const totalSompi = rewardSompi + feeSompi;
 
@@ -386,7 +396,7 @@ export function Chat({ onClose }: { onClose: () => void }) {
               value: k,
               label:
                 MODELS[k].label +
-                (h14Active && k === networkModel
+                (splitActive && k === networkModel
                   ? availability
                     ? ` · ${availability.available ? "available" : "unavailable"}`
                     : ""
