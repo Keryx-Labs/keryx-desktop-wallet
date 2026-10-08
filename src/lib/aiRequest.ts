@@ -395,6 +395,33 @@ export function buildAiRequestTx(
     marker,
   );
 
+  return assembleAiRequestTx(kaspa, {
+    selected,
+    changeSompi,
+    markerSompi,
+    changeAddress: args.changeAddress,
+    inferenceReward: args.inferenceReward,
+    payloadHex: bytesToHex(payload),
+  });
+}
+
+/**
+ * Unsigned AiRequest over exactly `selected`, in that order: the first input seeds the cohort of a
+ * sealed request, so it must not move after sealing.
+ */
+export function assembleAiRequestTx(
+  kaspa: KaspaTxSdk,
+  args: {
+    selected: RequestUtxo[];
+    changeSompi: bigint;
+    markerSompi?: bigint;
+    changeAddress: string;
+    inferenceReward: bigint;
+    payloadHex: string;
+  },
+): Transaction {
+  const { selected, changeSompi } = args;
+  const markerSompi = args.markerSompi ?? 0n;
   const changeScript = kaspa.payToAddressScript(args.changeAddress);
   const changeSpk = { version: changeScript.version, script: changeScript.script };
 
@@ -431,7 +458,7 @@ export function buildAiRequestTx(
     lockTime: 0n,
     subnetworkId: SUBNETWORK_ID_AI_REQUEST_HEX,
     gas: 0n,
-    payload: bytesToHex(payload),
+    payload: args.payloadHex,
   };
 
   return new kaspa.Transaction(itx);

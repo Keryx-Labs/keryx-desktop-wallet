@@ -11,11 +11,15 @@
     "dev:capture": "tauri dev --config src-tauri/tauri.capture.conf.json"
   },
   "dependencies": {
+    "@noble/ciphers": "^2.4.0",
+    "@noble/curves": "^2.4.0",
     "@noble/hashes": "^2.4.0",
     "@tauri-apps/api": "^2.0.0",
     "qrcode": "^1.5.4",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@fontsource-variable/jetbrains-mono": "^5.3.0",

@@ -4,7 +4,9 @@
 import * as kaspa from "../sdk/kaspa.js";
 import wasmUrl from "../sdk/kaspa_bg.wasm?url";
 import {
+  assembleAiRequestTx,
   buildAiRequestTx,
+  selectUtxosForRequest,
   computeInferenceReward,
   h14ActivationDaa,
   type AiAvailability,
@@ -227,6 +229,10 @@ class WalletService {
   private _networkId: string = DEFAULT_NODE.networkId;
   /** Wallet secret held while unlocked so signing does not prompt again; dropped on lock. */
   private signingSecret: string | null = null;
+  /** Chat key of the active wallet, keyed by account and network; dropped on lock. */
+  private chatKeyCache: { owner: string; address: string; privateKeyHex: string } | null = null;
+  /** Outpoints spent by sealed requests still listed as unspent by the node until they are mined. */
+  private aiSpentOutpoints = new Set<string>();
   /** Endpoint last requested through setNode; what ensureWallet rebuilds against. */
   private nodeSettings: NodeSettings = DEFAULT_NODE;
   /** The account address found to be mining, so the sweep runs once — see `holderReward`. */
@@ -1671,6 +1677,8 @@ class WalletService {
     this.accountAddresses = [];
     this._accountId = null;
     this.signingSecret = null;
+    this.chatKeyCache = null;
+    this.aiSpentOutpoints.clear();
     this.receiveAddress = null;
     this.receiveAddresses = [];
     this.pubGen = null;
@@ -2464,6 +2472,118 @@ class WalletService {
         fromAddress: this.receiveAddress ?? undefined,
       });
       return { txId, rewardSompi, feeSompi, requestHashHex, cursorHash };
+    } finally {
+      this.txInFlight = false;
+    }
+  }
+
+  /**
+   * Private key (hex) of receive address 0 and that address. Sealed chat requests and the local
+   * chat history are keyed to it, so both re-derive from the recovery phrase alone.
+   */
+  chatKey(): { address: string; privateKeyHex: string } {
+    if (!this.wallet || !this._accountId) throw new Error("Wallet is locked.");
+    if (!this.wasmReady) throw new Error("WASM not initialized");
+    const owner = `${this._accountId}|${this._networkId}`;
+    if (this.chatKeyCache?.owner === owner) return this.chatKeyCache;
+    const phrase = this.revealMnemonic(this.requireSigningSecret());
+    const xprv = new kaspa.XPrv(new kaspa.Mnemonic(phrase).toSeed());
+    const key = new kaspa.PrivateKeyGenerator(xprv.toString(), false, 0n).receiveKey(0);
+    this.chatKeyCache = {
+      owner,
+      address: key.toAddress(this._networkId).toString(),
+      privateKeyHex: key.toString(),
+    };
+    return this.chatKeyCache;
+  }
+
+  /**
+   * Submit a sealed AI request (subnetwork 0x03). Selects the inputs first, then asks `seal` for
+   * the payload: the first input's outpoint seeds the cohort and the root key, and the payload
+   * room depends on the input count. Signs and broadcasts exactly those inputs, in that order.
+   */
+  async submitSealedInference(req: {
+    rewardSompi: bigint;
+    feeSompi: bigint;
+    seal: (inputs: { transactionId: string; index: number }[]) => Promise<string>;
+  }): Promise<{ txId: string }> {
+    if (!this.wallet || !this._accountId) throw new Error("Wallet is locked.");
+    const password = this.requireSigningSecret();
+    if (this.conn !== "connected" || !this.synced) {
+      throw new Error("Connect to a synced node first.");
+    }
+    if (this.txInFlight) {
+      throw new Error("Another transaction is already in progress. Please wait.");
+    }
+    this.txInFlight = true;
+    try {
+      const keyMap = this.deriveKeyMap(password);
+      this.assertDerivationMatches(keyMap);
+      const signers = Array.from(keyMap.values()).map((k) => k.toString());
+
+      const entries = await this.fetchEntries();
+      const listed = new Set(
+        entries.map((e) => `${String(e.outpoint.transactionId)}:${Number(e.outpoint.index)}`),
+      );
+      for (const o of this.aiSpentOutpoints) if (!listed.has(o)) this.aiSpentOutpoints.delete(o);
+      const unspent = entries.filter(
+        (e) => !this.aiSpentOutpoints.has(`${String(e.outpoint.transactionId)}:${Number(e.outpoint.index)}`),
+      );
+      if (unspent.length === 0) throw new Error("No spendable UTXOs found.");
+      const used = unspent.slice(0, WalletService.MAX_TX_INPUTS);
+      this.assertEntriesCovered(used, keyMap);
+
+      const changeAddress = this.receiveAddress ?? this.accountAddresses[0];
+      if (!changeAddress) throw new Error("No change address available.");
+
+      const utxos: RequestUtxo[] = used.map((e) => ({
+        transactionId: String(e.outpoint.transactionId),
+        index: Number(e.outpoint.index),
+        amountSompi: BigInt(e.amount),
+        scriptPublicKey: {
+          version: e.scriptPublicKey.version,
+          script: e.scriptPublicKey.script,
+        },
+        blockDaaScore: BigInt(e.blockDaaScore ?? 0),
+        isCoinbase: !!e.isCoinbase,
+      }));
+      const { selected, changeSompi } = selectUtxosForRequest(
+        utxos,
+        req.feeSompi,
+        req.rewardSompi,
+        this.nodeDaa ?? 0n,
+      );
+
+      const payloadHex = await req.seal(
+        selected.map((u) => ({ transactionId: u.transactionId, index: u.index })),
+      );
+      const tx = this.stageSync("build", () =>
+        assembleAiRequestTx(kaspa as never, {
+          selected,
+          changeSompi,
+          changeAddress,
+          inferenceReward: req.rewardSompi,
+          payloadHex,
+        }),
+      );
+      // Keys as HEX STRINGS, not PrivateKey instances (packaged-build wasm-bindgen quirk).
+      const signed = this.stageSync("sign", () =>
+        kaspa.signTransaction(tx as never, signers as never, true),
+      );
+      const res = await this.stage("submit", () =>
+        this.wallet!.rpc.submitTransaction({ transaction: signed as never }),
+      );
+      const txId = res?.transactionId ?? "";
+      for (const u of selected) this.aiSpentOutpoints.add(`${u.transactionId}:${u.index}`);
+      this.recordLocalActivity({
+        id: txId,
+        type: "outgoing",
+        direction: "out",
+        amountSompi: req.feeSompi + req.rewardSompi,
+        timestamp: Date.now(),
+        fromAddress: this.receiveAddress ?? undefined,
+      });
+      return { txId };
     } finally {
       this.txInFlight = false;
     }
