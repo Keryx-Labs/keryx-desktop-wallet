@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Default capability set for the main window.",
   "windows": ["main"],
-  "permissions": ["core:default", "allow-save-escrow-cert", "allow-krx-market-price"]
+  "permissions": ["core:default", "allow-save-escrow-cert"]
 }

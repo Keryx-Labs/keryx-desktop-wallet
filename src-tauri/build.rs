@@ -1,11 +1,10 @@
 fn main() {
-    // The `allow-*` permissions in capabilities/default.json are generated from this list.
+    // `allow-save-escrow-cert` in capabilities/default.json is generated from this list.
     // Without it the capability check only knows the core plugins, and the build rejects
-    // the custom commands.
+    // the command.
     tauri_build::try_build(
-        tauri_build::Attributes::new().app_manifest(
-            tauri_build::AppManifest::new().commands(&["save_escrow_cert", "krx_market_price"]),
-        ),
+        tauri_build::Attributes::new()
+            .app_manifest(tauri_build::AppManifest::new().commands(&["save_escrow_cert"])),
     )
     .expect("failed to run tauri build script");
 }

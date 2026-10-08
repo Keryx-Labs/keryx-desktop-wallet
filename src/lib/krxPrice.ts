@@ -1,8 +1,12 @@
-import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useState } from "react";
 
-/** How often the NonKYC last price is re-read. A market quote does not need the 15s history poll. */
+/** Explorer market snapshot: NonKYC KRX/USDT, refreshed by the API every minute. Mainnet price on every network. */
+const MARKET_URL = "https://keryx-labs.com/api/v1/market";
+
+/** How often the price is re-read. A market quote does not need the 15s history poll. */
 const POLL_MS = 60_000;
+
+const FETCH_TIMEOUT_MS = 8_000;
 
 /**
  * How long the last good quote stays on screen once refreshes start failing. Past this the price
@@ -25,9 +29,17 @@ export interface KrxPrice {
   changePercent: string;
 }
 
-interface TickerResponse {
-  last_price: string;
-  change_percent: string;
+interface MarketResponse {
+  price_usd?: unknown;
+  change_24h_pct?: unknown;
+  updated_ms?: unknown;
+}
+
+/** Plain decimal text of a JSON number, never in exponent form. */
+function decimalText(v: unknown): string | null {
+  if (typeof v !== "number" || !Number.isFinite(v)) return null;
+  const s = Math.abs(v) < 1e-6 ? v.toFixed(18).replace(/\.?0+$/, "") : String(v);
+  return /e/i.test(s) ? null : s;
 }
 
 let snapshot: KrxPrice | null = null;
@@ -36,17 +48,32 @@ const listeners = new Set<(price: KrxPrice | null) => void>();
 let timer: number | null = null;
 let inflight = false;
 
-function parseTicker(raw: TickerResponse): KrxPrice | null {
-  if (typeof raw?.last_price !== "string" || !/^\d{1,12}(\.\d{1,18})?$/.test(raw.last_price)) return null;
-  const [whole, frac = ""] = raw.last_price.split(".");
+function parseMarket(raw: MarketResponse): KrxPrice | null {
+  // A snapshot the API has not refreshed for a while is no longer the market.
+  if (typeof raw?.updated_ms !== "number" || Date.now() - raw.updated_ms > STALE_MS) return null;
+  const lastPrice = decimalText(raw.price_usd);
+  if (!lastPrice || !/^\d{1,12}(\.\d{1,18})?$/.test(lastPrice)) return null;
+  const [whole, frac = ""] = lastPrice.split(".");
   // A zero quote would print "$0.00" beside a real balance.
   if (BigInt(whole + frac) === 0n) return null;
   return {
-    lastPrice: raw.last_price,
+    lastPrice,
     priceInt: BigInt(whole + frac),
     priceScale: frac.length,
-    changePercent: typeof raw.change_percent === "string" ? raw.change_percent : "",
+    changePercent: decimalText(raw.change_24h_pct) ?? "",
   };
+}
+
+async function fetchMarket(): Promise<MarketResponse> {
+  const ctrl = new AbortController();
+  const t = window.setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(MARKET_URL, { signal: ctrl.signal });
+    if (!res.ok) throw new Error(`market ${res.status}`);
+    return (await res.json()) as MarketResponse;
+  } finally {
+    window.clearTimeout(t);
+  }
 }
 
 function publish(next: KrxPrice | null) {
@@ -58,15 +85,14 @@ async function refresh() {
   if (inflight) return;
   inflight = true;
   try {
-    const raw = await invoke<TickerResponse>("krx_market_price");
-    const next = parseTicker(raw);
+    const next = parseMarket(await fetchMarket());
     if (!next) throw new Error("unusable ticker");
     snapshotAt = Date.now();
     publish(next);
   } catch {
-    // Timeout, offline, exchange down or a bad payload. Keep the last good quote for a while so a
+    // Timeout, offline, API down or a bad payload. Keep the last good quote for a while so a
     // blip does not blank a number the user is looking at, then drop it once it is too old.
-    // Polling carries on, so the price comes back by itself when the exchange does.
+    // Polling carries on, so the price comes back by itself.
     if (snapshot && Date.now() - snapshotAt > STALE_MS) publish(null);
   } finally {
     inflight = false;
