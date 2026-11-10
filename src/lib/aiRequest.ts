@@ -49,7 +49,14 @@ export const INFERENCE_REWARD_TOKEN_STEP = 5_000_000n;
 /** H14. Mirrors the node's `private_inference_activation`: flat inference_reward, tier 3 becomes Qwen3.8-27B. */
 export function h14ActivationDaa(networkId: string): bigint {
   if (networkId === "mainnet") return 121_985_000n;
-  if (networkId === "testnet" || networkId === "testnet-10") return 6_000n;
+  if (networkId === "testnet" || networkId === "testnet-10") return 1n;
+  return BigInt(Number.MAX_SAFE_INTEGER);
+}
+
+/** H15. Mirrors the node's `H15_ACTIVATION_DAA`: chat requests seal with key schedule 2. */
+export function h15ActivationDaa(networkId: string): bigint {
+  if (networkId === "mainnet") return 140_115_000n;
+  if (networkId === "testnet" || networkId === "testnet-10") return 3_500n;
   return BigInt(Number.MAX_SAFE_INTEGER);
 }
 /** Keyless reward vault script (OP_RETURN "aivault"), output[1] of every request. */

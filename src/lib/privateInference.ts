@@ -3,7 +3,8 @@
  *
  * Byte-for-byte mirror of keryx-node `inference/src/private.rs` (envelopes, key schedule) and
  * `consensus/core/src/collateral.rs` (target cohort). A request is sealed to the escrow keys of
- * the whole tier cohort; the answer comes back sealed to the requester's root key.
+ * the whole tier cohort; the answer comes back sealed to the requester (key schedule 2 from the
+ * H15 gate on, schedule 1 before; both are opened).
  */
 
 import { secp256k1 } from "@noble/curves/secp256k1.js";
@@ -33,10 +34,17 @@ export const SEAL_WINDOW_DAA = 18_000;
 const AI_RESPONSE_V1_LEN = 78;
 const AI_RESPONSE_V2_LEN = 174;
 const AI_RESPONSE_EXT_PRIVATE_BODY = 0x80;
+const AI_RESPONSE_EXT_TRACE = 0x81;
+const AI_RESPONSE_TRACE_LEN = 41;
+/** The stage-2 trace commitment: the stage-1 one followed by `[tokens_root: 32]`. */
+const AI_RESPONSE_TRACE_TOKENS_LEN = AI_RESPONSE_TRACE_LEN + 32;
 const AI_RESPONSE_EXT_HEADER_LEN = 5;
 
 const utf8 = (s: string) => new TextEncoder().encode(s);
-const KDF_SALT = utf8("KeryxPrivateInferenceV1");
+const KDF_SALT_V1 = utf8("KeryxPrivateInferenceV1");
+const KDF_SALT_V2 = utf8("KeryxPrivateInferenceV2");
+const INFO_ROOT = utf8("root");
+const INFO_EPHEMERAL = utf8("ephemeral");
 const INFO_KEK = utf8("kek");
 const INFO_PROMPT = utf8("prompt");
 const INFO_RESPONSE = utf8("response");
@@ -193,12 +201,38 @@ export function sealRecipients(seed: Uint8Array, cohortHex: string[], windowHex:
 
 // ── Root key ──────────────────────────────────────────────────────────────────
 
+/** Key schedule of a request (keryx-node `private.rs`); not on the wire. */
+export type KeySchedule = 1 | 2;
+
 /**
- * Root key of a request, derived from the wallet key and the cohort seed (the first input's
- * outpoint, spent once). Re-derivable later from the seed phrase and the on-chain request alone.
+ * Secret of a request, derived from the wallet key and the cohort seed (the first input's
+ * outpoint, spent once): the seed of key schedule 2, or the root key of schedule 1.
+ * Re-derivable later from the seed phrase and the on-chain request alone.
  */
-export function deriveRootKey(privateKeyHex: string, seed: Uint8Array): Uint8Array {
+export function deriveRequestSecret(privateKeyHex: string, seed: Uint8Array): Uint8Array {
   return hkdf32(ROOT_KEY_SALT, hexToBytes(privateKeyHex), ROOT_KEY_INFO, seed);
+}
+
+function scheduleSalt(schedule: KeySchedule): Uint8Array {
+  return schedule === 2 ? KDF_SALT_V2 : KDF_SALT_V1;
+}
+
+function rootKeyOf(secret: Uint8Array, schedule: KeySchedule): Uint8Array {
+  return schedule === 2 ? hkdf32(KDF_SALT_V2, secret, INFO_ROOT) : secret;
+}
+
+/** Schedule 2's ephemeral secret: the first valid scalar of `HKDF(seed, "ephemeral" ‖ ctr)`. */
+function ephemeralSecretV2(seed: Uint8Array): Uint8Array {
+  for (let ctr = 0; ctr <= 255; ctr++) {
+    const k = hkdf32(KDF_SALT_V2, seed, INFO_EPHEMERAL, new Uint8Array([ctr]));
+    if (secp256k1.utils.isValidSecretKey(k)) return k;
+  }
+  throw new Error("no valid ephemeral scalar");
+}
+
+/** libsecp ECDH with the BIP-340 even-Y lift of an x-only key: SHA-256 of the compressed point. */
+function ecdh(secret: Uint8Array, xOnly: Uint8Array): Uint8Array {
+  return sha256(secp256k1.getSharedSecret(secret, concat(new Uint8Array([0x02]), xOnly), true));
 }
 
 // ── Seal / open ───────────────────────────────────────────────────────────────
@@ -212,7 +246,9 @@ export interface SealRequestArgs {
   prompt: string | Uint8Array;
   /** Escrow keys to seal to (hex, any order, duplicates ignored). */
   recipientsHex: string[];
-  rootKey: Uint8Array;
+  /** See `deriveRequestSecret`. */
+  secret: Uint8Array;
+  schedule: KeySchedule;
 }
 
 /** Builds the payload of a private AiRequest: public header ‖ sealed envelope. Returns hex. */
@@ -220,7 +256,7 @@ export function sealRequest(args: SealRequestArgs): string {
   const keys = sortedUniqueKeys(args.recipientsHex);
   if (keys.length === 0) throw new Error("no recipients: no miner of this tier is eligible right now");
   if (keys.length > MAX_PRIVATE_RECIPIENTS) throw new Error(`too many recipients: ${keys.length}`);
-  if (args.rootKey.length !== ROOT_KEY_LEN) throw new Error("root key must be 32 bytes");
+  if (args.secret.length !== ROOT_KEY_LEN) throw new Error("request secret must be 32 bytes");
   const prompt = typeof args.prompt === "string" ? utf8(args.prompt) : args.prompt;
   const maxPrompt = maxPrivatePromptLen(keys.length);
   if (prompt.length > maxPrompt) {
@@ -228,15 +264,15 @@ export function sealRequest(args: SealRequestArgs): string {
   }
 
   const header = requestHeaderBytes(args.modelIdHex, args.maxTokens, args.inferenceRewardSompi, args.priorityFeeSompi);
+  const salt = scheduleSalt(args.schedule);
+  const rootKey = rootKeyOf(args.secret, args.schedule);
   const nonce = randomBytes(NONCE_LEN);
-  const ephemeralSecret = secp256k1.utils.randomSecretKey();
+  const ephemeralSecret = args.schedule === 2 ? ephemeralSecretV2(args.secret) : secp256k1.utils.randomSecretKey();
   const ephemeralPubkey = secp256k1.getPublicKey(ephemeralSecret, true);
 
   const entries = keys.map((key) => {
-    // BIP-340 even-Y lift of the x-only escrow key; libsecp ECDH = SHA-256(compressed shared point).
-    const shared = sha256(secp256k1.getSharedSecret(ephemeralSecret, concat(new Uint8Array([0x02]), key), true));
-    const kek = hkdf32(KDF_SALT, shared, INFO_KEK, ephemeralPubkey, key);
-    return concat(key, chacha20poly1305(kek, nonce, header).encrypt(args.rootKey));
+    const kek = hkdf32(salt, ecdh(ephemeralSecret, key), INFO_KEK, ephemeralPubkey, key);
+    return concat(key, chacha20poly1305(kek, nonce, header).encrypt(rootKey));
   });
   const envelopeHeader = concat(
     PRIVATE_MAGIC,
@@ -246,13 +282,22 @@ export function sealRequest(args: SealRequestArgs): string {
     new Uint8Array([keys.length]),
     ...entries
   );
-  const promptKey = hkdf32(KDF_SALT, args.rootKey, INFO_PROMPT);
+  const promptKey = hkdf32(salt, rootKey, INFO_PROMPT);
   const ciphertext = chacha20poly1305(promptKey, nonce, concat(header, envelopeHeader)).encrypt(prompt);
   return bytesToHex(concat(header, envelopeHeader, ciphertext));
 }
 
+/** Runs `open` under schedule 2 then 1; the AEAD tag tells which one sealed the request. */
+function underEitherSchedule<T>(open: (schedule: KeySchedule) => T): T {
+  try {
+    return open(2);
+  } catch {
+    return open(1);
+  }
+}
+
 /** Requester side: reads back the prompt of one of its own sealed requests from its payload. */
-export function openOwnPrompt(rootKey: Uint8Array, payload: Uint8Array): string {
+export function openOwnPrompt(secret: Uint8Array, payload: Uint8Array): string {
   const prompt = payload.subarray(AI_REQUEST_HEADER_LEN);
   if (prompt.length < REQUEST_ENVELOPE_HEADER_LEN || compareBytes(prompt.subarray(0, 4), PRIVATE_MAGIC) !== 0) {
     throw new Error("not a private-inference envelope");
@@ -262,21 +307,50 @@ export function openOwnPrompt(rootKey: Uint8Array, payload: Uint8Array): string 
   const headerLen = REQUEST_ENVELOPE_HEADER_LEN + prompt[50] * RECIPIENT_ENTRY_LEN;
   if (prompt.length < headerLen + TAG_LEN) throw new Error("truncated envelope");
   const aad = concat(payload.subarray(0, AI_REQUEST_HEADER_LEN), prompt.subarray(0, headerLen));
-  const promptKey = hkdf32(KDF_SALT, rootKey, INFO_PROMPT);
-  return new TextDecoder().decode(chacha20poly1305(promptKey, nonce, aad).decrypt(prompt.subarray(headerLen)));
+  const plain = underEitherSchedule((schedule) => {
+    const promptKey = hkdf32(scheduleSalt(schedule), rootKeyOf(secret, schedule), INFO_PROMPT);
+    return chacha20poly1305(promptKey, nonce, aad).decrypt(prompt.subarray(headerLen));
+  });
+  return new TextDecoder().decode(plain);
 }
 
 /** Requester side: opens an answer body sealed by `responderEscrowHex` for `requestIdHex`. */
-export function openResponse(rootKey: Uint8Array, requestIdHex: string, responderEscrowHex: string, body: Uint8Array): string {
+export function openResponse(secret: Uint8Array, requestIdHex: string, responderEscrowHex: string, body: Uint8Array): string {
   if (body.length < RESPONSE_ENVELOPE_HEADER_LEN + TAG_LEN || compareBytes(body.subarray(0, 4), PRIVATE_MAGIC) !== 0) {
     throw new Error("not a private-inference envelope");
   }
   if (body[4] !== PRIVATE_VERSION) throw new Error("unsupported envelope version");
   const responder = hexToBytes(responderEscrowHex);
   const nonce = body.subarray(5, RESPONSE_ENVELOPE_HEADER_LEN);
-  const key = hkdf32(KDF_SALT, rootKey, INFO_RESPONSE, responder);
   const aad = concat(hexToBytes(requestIdHex), responder);
-  return new TextDecoder().decode(chacha20poly1305(key, nonce, aad).decrypt(body.subarray(RESPONSE_ENVELOPE_HEADER_LEN)));
+  const plain = underEitherSchedule((schedule) => {
+    const rootKey = rootKeyOf(secret, schedule);
+    const key =
+      schedule === 2
+        ? hkdf32(KDF_SALT_V2, concat(ecdh(ephemeralSecretV2(secret), responder), rootKey), INFO_RESPONSE, responder)
+        : hkdf32(KDF_SALT_V1, rootKey, INFO_RESPONSE, responder);
+    return chacha20poly1305(key, nonce, aad).decrypt(body.subarray(RESPONSE_ENVELOPE_HEADER_LEN));
+  });
+  return new TextDecoder().decode(splitAnswer(plain).text);
+}
+
+const TOKENS_MAGIC = new TextEncoder().encode("KXTK");
+const TOKENS_TRAILER_LEN = 8;
+
+/**
+ * Splits a decrypted answer into its text and, for a stage-2 answer, the token ids of its
+ * generated positions (`text ‖ ids u32 LE ‖ count u32 LE ‖ "KXTK"`).
+ */
+export function splitAnswer(plain: Uint8Array): { text: Uint8Array; ids: number[] | null } {
+  const body = plain.length - TOKENS_TRAILER_LEN;
+  if (body < 0 || compareBytes(plain.subarray(body + 4), TOKENS_MAGIC) !== 0) return { text: plain, ids: null };
+  const view = new DataView(plain.buffer, plain.byteOffset, plain.byteLength);
+  const n = view.getUint32(body, true);
+  const textLen = body - 4 * n;
+  if (textLen < 0) return { text: plain, ids: null };
+  const ids: number[] = [];
+  for (let i = 0; i < n; i++) ids.push(view.getUint32(textLen + 4 * i, true));
+  return { text: plain.subarray(0, textLen), ids };
 }
 
 // ── AiResponse payload ────────────────────────────────────────────────────────
@@ -292,15 +366,27 @@ export interface ParsedAiResponse {
   privateBody: Uint8Array | null;
 }
 
-/** Parses an AiResponse payload: 78 bytes, 174 bytes, or 174 + inline sealed body. */
+/** Parses an AiResponse payload: 78 bytes, 174 bytes, or 174 + inline sealed body [+ trace commitment]. */
 export function parseAiResponse(payload: Uint8Array): ParsedAiResponse | null {
   let privateBody: Uint8Array | null = null;
   if (payload.length > AI_RESPONSE_V2_LEN) {
-    if (payload.length < AI_RESPONSE_V2_LEN + AI_RESPONSE_EXT_HEADER_LEN + 1) return null;
     if (payload[AI_RESPONSE_V2_LEN] !== AI_RESPONSE_EXT_PRIVATE_BODY) return null;
-    const len = new DataView(payload.buffer, payload.byteOffset + AI_RESPONSE_V2_LEN + 1, 4).getUint32(0, true);
-    if (payload.length !== AI_RESPONSE_V2_LEN + AI_RESPONSE_EXT_HEADER_LEN + len) return null;
-    privateBody = payload.subarray(AI_RESPONSE_V2_LEN + AI_RESPONSE_EXT_HEADER_LEN);
+    let o = AI_RESPONSE_V2_LEN;
+    while (o < payload.length) {
+      if (o + AI_RESPONSE_EXT_HEADER_LEN > payload.length) return null;
+      const kind = payload[o];
+      const len = new DataView(payload.buffer, payload.byteOffset + o + 1, 4).getUint32(0, true);
+      const end = o + AI_RESPONSE_EXT_HEADER_LEN + len;
+      if (end > payload.length) return null;
+      if (kind === AI_RESPONSE_EXT_PRIVATE_BODY && privateBody === null) {
+        privateBody = payload.subarray(o + AI_RESPONSE_EXT_HEADER_LEN, end);
+      } else if (kind === AI_RESPONSE_EXT_TRACE && privateBody !== null && (len === AI_RESPONSE_TRACE_LEN || len === AI_RESPONSE_TRACE_TOKENS_LEN) && end === payload.length) {
+        // trace commitment: nothing to show here
+      } else {
+        return null;
+      }
+      o = end;
+    }
   } else if (payload.length !== AI_RESPONSE_V1_LEN && payload.length !== AI_RESPONSE_V2_LEN) {
     return null;
   }

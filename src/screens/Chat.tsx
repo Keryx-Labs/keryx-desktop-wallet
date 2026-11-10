@@ -3,10 +3,10 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { wallet, formatKrx } from "../lib/wallet";
 import { useWalletState } from "../lib/useWallet";
-import { MODELS, ModelName, MIN_AI_REQUEST_PRIORITY_FEE, h14ActivationDaa } from "../lib/aiRequest";
+import { MODELS, ModelName, MIN_AI_REQUEST_PRIORITY_FEE, h14ActivationDaa, h15ActivationDaa } from "../lib/aiRequest";
 import { AiProviders, explorerApi, explorerBase } from "../lib/explorerApi";
 import {
-  bytesToHex, cohortSeed, compressPrompt, deriveRootKey, hexToBytes, maxPrivatePromptLen, maxRequestPayloadLen, openResponse, sealRecipients, sealRequest,
+  bytesToHex, cohortSeed, compressPrompt, deriveRequestSecret, hexToBytes, maxPrivatePromptLen, maxRequestPayloadLen, openResponse, sealRecipients, sealRequest,
 } from "../lib/privateInference";
 import { byteLength, ChatMessage, composePrompt, Conversation, loadConversations, saveConversations } from "../lib/chatStore";
 import { buildKeryxContext, fetchLiveFacts, isKeryxQuestion, namesKeryx } from "../lib/keryxContext";
@@ -215,12 +215,12 @@ export function Chat({ onClose }: { onClose: () => void }) {
         const result = await api.inferenceResult(message.id).catch(() => null);
         const responses = result?.sealed_responses ?? [];
         if (responses.length > 0) {
-          const rootKey = deriveRootKey(privateKeyHex, hexToBytes(message.seedHex));
+          const secret = deriveRequestSecret(privateKeyHex, hexToBytes(message.seedHex));
           let unreadable: string | null = null;
           let opened = false;
           for (const response of responses) {
             try {
-              const answer = openResponse(rootKey, message.id, response.responder_pubkey, hexToBytes(response.body));
+              const answer = openResponse(secret, message.id, response.responder_pubkey, hexToBytes(response.body));
               patchMessage(message.id, { status: "answered", answer, responder: response.responder_pubkey, answeredAt: Date.now() });
               opened = true;
               break;
@@ -400,7 +400,8 @@ export function Chat({ onClose }: { onClose: () => void }) {
               priorityFeeSompi: MIN_PRIORITY_FEE_SOMPI,
               prompt: encoded,
               recipientsHex: recipients,
-              rootKey: deriveRootKey(walletKey.privateKeyHex, seed),
+              secret: deriveRequestSecret(walletKey.privateKeyHex, seed),
+              schedule: w.nodeDaa != null && BigInt(w.nodeDaa) >= h15ActivationDaa(networkId) ? 2 : 1,
             });
           },
         });
