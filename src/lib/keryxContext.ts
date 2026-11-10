@@ -201,7 +201,7 @@ function priceWords(usd: number): string {
 function liveLines(f: LiveFacts): string[] {
   const lines: string[] = [];
   const when = new Date(f.fetchedAt).toISOString().replace("T", " ").slice(0, 16) + " UTC";
-  const testnet = !!f.info && f.info.network !== "mainnet";
+  const testnet = !!f.info && f.info.network !== "mainnet" && f.info.network !== "keryx-mainnet";
   lines.push(`Data fetched from keryx-labs.com at ${when}.`);
   if (testnet) lines.push(`These live numbers describe the public testnet (${f.info!.network}), not mainnet: testnet coins have no value and its supply, hashrate and miner counts are much smaller than mainnet's.`);
   if (f.info) {
@@ -213,7 +213,7 @@ function liveLines(f: LiveFacts): string[] {
     lines.push(
       `Supply: ${Math.round(i.total_supply_krx).toLocaleString("en-US")} coins in circulation after burns, ` +
         `${Math.round(i.burned_krx).toLocaleString("en-US")} coins burned so far, max supply ${Math.round(i.max_supply_krx).toLocaleString("en-US")} coins ` +
-        `(${(i.mined_pct * 100).toFixed(2)} % emitted). ${Math.round(i.total_escrow_krx).toLocaleString("en-US")} coins locked in miner escrow. ` +
+        `(${i.mined_pct.toFixed(2)} % emitted). ${Math.round(i.total_escrow_krx).toLocaleString("en-US")} coins locked in miner escrow. ` +
         `${i.total_real_inferences.toLocaleString("en-US")} inferences served on-chain.`
     );
   }
