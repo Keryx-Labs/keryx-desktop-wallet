@@ -64,7 +64,7 @@ jobs:
         include:
           - platform: windows-latest   # → .exe (NSIS) + portable .exe
           - platform: ubuntu-22.04      # → .deb + .AppImage
-          - platform: macos-14          # → universal .app + .dmg (Apple Silicon + Intel)
+          - platform: macos-15          # → universal .app + .dmg (Apple Silicon + Intel)
             args: '--target universal-apple-darwin'
     runs-on: ${{ matrix.platform }}
 
@@ -94,7 +94,7 @@ jobs:
       # A universal macOS binary is a lipo-merged aarch64 + x86_64 build, so both Apple Silicon
       # and Intel stdlib targets must be installed. No-op on Windows/Linux (skipped via the `if`).
       - name: Add macOS Rust targets (universal binary)
-        if: matrix.platform == 'macos-14'
+        if: matrix.platform == 'macos-15'
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Cache cargo
@@ -114,7 +114,7 @@ jobs:
       # a present-but-empty APPLE_CERTIFICATE as a certificate to import, which fails. So only
       # export the variables that actually have a value.
       - name: Export Apple signing secrets (only those set)
-        if: matrix.platform == 'macos-14'
+        if: matrix.platform == 'macos-15'
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
